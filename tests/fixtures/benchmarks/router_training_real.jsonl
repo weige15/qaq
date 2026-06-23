@@ -1,0 +1,5 @@
+{"id": "router-train-0", "split": "train", "text": "Which precision path should a short arithmetic prompt use when the answer is stable?", "target": "stable-low-cost"}
+{"id": "router-train-1", "split": "train", "text": "Explain why a longer reasoning prompt may need more quantized precision in attention blocks.", "target": "attention-sensitive"}
+{"id": "router-train-2", "split": "train", "text": "Summarize the memory trade-off for loading fewer bit planes during inference.", "target": "memory-tradeoff"}
+{"id": "router-valid-0", "split": "validation", "text": "Route a compact factual prompt with limited precision pressure.", "target": "validation-low"}
+{"id": "router-valid-1", "split": "validation", "text": "Route a precision-sensitive prompt that compares quantized reconstruction choices.", "target": "validation-high"}

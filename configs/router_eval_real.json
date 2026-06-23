@@ -1,0 +1,22 @@
+{
+  "model": "tests/fixtures/models/router_local_model.json",
+  "tokenizer": "tests/fixtures/tokenizers/router_local_tokenizer.json",
+  "dataset": "tests/fixtures/benchmarks/router_training_real.jsonl",
+  "split": "validation",
+  "mode": "qaq_on_demand_off",
+  "precision_candidates": [4, 8],
+  "max_bit_width": 8,
+  "block_granularity": "mha_ffn",
+  "device": "cpu",
+  "gpu_ids": [],
+  "seed": 0,
+  "output_dir": "runs/router_eval_real",
+  "overwrite": true,
+  "logging": {
+    "console": false
+  },
+  "prompt_format": "question_answer_v1",
+  "metric": "router_acceptance",
+  "router_checkpoint": "runs/router_train_real/checkpoints/router_step_0003.json",
+  "router_diagnostic": false
+}

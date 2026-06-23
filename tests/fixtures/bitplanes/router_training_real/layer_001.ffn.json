@@ -1,0 +1,38 @@
+{
+  "metadata": {
+    "artifact_version": "qaq.bitplane.v1",
+    "available_planes": [0, 1, 2, 3, 4, 5, 6, 7],
+    "block_id": "layer_001.ffn",
+    "checksum": null,
+    "checkpoint_ref": "router-real-fixture",
+    "compatibility": {
+      "block_granularity": "mha_ffn"
+    },
+    "max_bit_width": 8,
+    "model_id": "tests/fixtures/models/router_local_model.json",
+    "original_dtype": "uint8",
+    "original_shape": [1, 2],
+    "quantization": {
+      "group_size": null,
+      "max_bit_width": 8,
+      "qmax": 255,
+      "qmin": 0,
+      "scale": 1.0,
+      "scheme": "uint_identity",
+      "zero_point": 0
+    },
+    "reconstruction_policy": "msb_truncation",
+    "tensor_name": "layers.1.ffn.gate_proj.weight",
+    "validation_status": "valid"
+  },
+  "planes": {
+    "0": [[0, 0]],
+    "1": [[0, 0]],
+    "2": [[0, 0]],
+    "3": [[0, 0]],
+    "4": [[0, 0]],
+    "5": [[1, 1]],
+    "6": [[0, 1]],
+    "7": [[0, 1]]
+  }
+}

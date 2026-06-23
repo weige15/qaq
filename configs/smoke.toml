@@ -1,0 +1,18 @@
+model = "fake-model"
+tokenizer = "fake-tokenizer"
+dataset = "toy_prompts"
+split = "smoke"
+mode = "fp16"
+precision_candidates = [4, 8]
+max_bit_width = 8
+block_granularity = "mha_ffn"
+gpu_ids = []
+seed = 0
+output_dir = "runs/smoke/fp16"
+overwrite = false
+
+[logging]
+progress_interval_steps = 10
+checkpoint_interval_steps = 100
+console = true
+log_dir = "runs/smoke/logs"

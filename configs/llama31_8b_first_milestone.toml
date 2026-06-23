@@ -1,0 +1,20 @@
+model = "meta-llama/Llama-3.1-8B"
+tokenizer = "meta-llama/Llama-3.1-8B"
+dataset = "wikitext2"
+split = "validation"
+mode = "qaq_on_demand_off"
+precision_candidates = [4, 8]
+max_bit_width = 8
+block_granularity = "mha_ffn"
+gpu_ids = [0]
+seed = 0
+output_dir = "runs/llama31_8b_first_milestone/qaq_on_demand_off"
+overwrite = false
+router_checkpoint = "runs/router/llama31_8b/router_checkpoint.json"
+router_diagnostic = false
+
+[logging]
+progress_interval_steps = 10
+checkpoint_interval_steps = 500
+console = true
+log_dir = "runs/llama31_8b_first_milestone/logs"

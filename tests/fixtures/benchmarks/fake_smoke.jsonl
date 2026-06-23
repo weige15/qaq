@@ -1,0 +1,2 @@
+{"id": "fixture-0", "split": "validation", "text": "Fixture prompt alpha for the adapter.", "target": "alpha", "source": "fixture"}
+{"id": "fixture-1", "split": "validation", "text": "Fixture prompt beta is intentionally longer for context tests.", "target": "beta", "source": "fixture"}

@@ -1,0 +1,843 @@
+"""Model adapter contracts, fake smoke implementation, and optional HF Llama support."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from qaq.benchmark_adapter import TokenizedBenchmarkBatch, build_tokenized_batch
+from qaq.config import RunConfig
+from qaq.data import BenchmarkExample, load_benchmark_examples
+
+
+@dataclass(slots=True)
+class ModelAdapterError(ValueError):
+    """Raised when a model or tokenizer cannot be adapted for QAQ."""
+
+    code: str
+    message: str
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"
+
+
+@dataclass(slots=True)
+class FakeParameter:
+    name: str
+    requires_grad: bool = True
+
+
+@dataclass(frozen=True, slots=True)
+class HuggingFaceParameterView:
+    """Named view over a real model parameter."""
+
+    name: str
+    parameter: Any
+
+    @property
+    def requires_grad(self) -> bool:
+        return bool(getattr(self.parameter, "requires_grad", False))
+
+
+@dataclass(frozen=True, slots=True)
+class FakeArchitectureBlock:
+    tensor_names: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class FakeArchitectureLayer:
+    mha: FakeArchitectureBlock
+    ffn: FakeArchitectureBlock
+
+
+@dataclass(frozen=True, slots=True)
+class FakeModelArchitectureMetadata:
+    model_id: str
+    layers: tuple[FakeArchitectureLayer, ...]
+    hidden_size: int
+    vocab_size: int
+    framework: str = "qaq_fake"
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "model_id": self.model_id,
+            "framework": self.framework,
+            "hidden_size": self.hidden_size,
+            "vocab_size": self.vocab_size,
+            "num_layers": len(self.layers),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class HiddenStateBundle:
+    """Router feature tensors keyed by controlled block ID."""
+
+    feature_source: str
+    by_block: dict[str, tuple[tuple[float, ...], ...]]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "feature_source": self.feature_source,
+            "by_block": {
+                block_id: [list(vector) for vector in vectors]
+                for block_id, vectors in self.by_block.items()
+            },
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceBatchOutput:
+    """Reference execution output consumed by later runtimes and metrics."""
+
+    logits: tuple[tuple[float, ...], ...]
+    losses: tuple[float | None, ...]
+    predictions: tuple[int, ...]
+    hidden_states: HiddenStateBundle
+    metadata: dict[str, Any]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "logits": [list(row) for row in self.logits],
+            "losses": list(self.losses),
+            "predictions": list(self.predictions),
+            "hidden_states": self.hidden_states.as_dict(),
+            "metadata": dict(self.metadata),
+        }
+
+
+class FakeTokenizer:
+    """Deterministic character tokenizer for CPU-only smoke tests."""
+
+    pad_token_id = 0
+
+    def __init__(self, tokenizer_id: str, *, model_max_length: int = 128) -> None:
+        if model_max_length <= 0:
+            raise ModelAdapterError(
+                "invalid_tokenizer_metadata",
+                "model_max_length must be positive",
+            )
+        self.tokenizer_id = tokenizer_id
+        self.model_max_length = model_max_length
+
+    def encode(self, text: str) -> tuple[int, ...]:
+        if not isinstance(text, str):
+            raise ModelAdapterError("invalid_input", "tokenizer input must be text")
+        if not text:
+            return (1,)
+        return tuple((ord(character) % 251) + 1 for character in text)
+
+
+class FakeCausalLMAdapter:
+    """Small deterministic causal-LM-shaped adapter for local tests."""
+
+    feature_source = "block_output_pooled"
+
+    def __init__(
+        self,
+        *,
+        model_id: str,
+        tokenizer: FakeTokenizer,
+        num_layers: int = 2,
+        hidden_size: int = 4,
+        vocab_size: int = 8,
+    ) -> None:
+        if num_layers <= 0:
+            raise ModelAdapterError(
+                "invalid_model_metadata",
+                "num_layers must be positive",
+            )
+        if hidden_size <= 0:
+            raise ModelAdapterError(
+                "invalid_model_metadata",
+                "hidden_size must be positive",
+            )
+        if vocab_size <= 0:
+            raise ModelAdapterError(
+                "invalid_model_metadata",
+                "vocab_size must be positive",
+            )
+        self.model_id = model_id
+        self.tokenizer = tokenizer
+        self.num_layers = num_layers
+        self.hidden_size = hidden_size
+        self.vocab_size = vocab_size
+        self._parameters = tuple(
+            FakeParameter(name=f"layers.{layer_index}.weight")
+            for layer_index in range(num_layers)
+        )
+        self.architecture_metadata = _make_fake_architecture_metadata(
+            model_id=model_id,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            vocab_size=vocab_size,
+        )
+
+    def parameters(self) -> tuple[FakeParameter, ...]:
+        return self._parameters
+
+    def freeze_base_model(self) -> None:
+        for parameter in self._parameters:
+            parameter.requires_grad = False
+
+    def load_examples(
+        self,
+        config: RunConfig,
+        *,
+        limit: int | None = None,
+    ) -> tuple[BenchmarkExample, ...]:
+        return load_benchmark_examples(config.dataset, split=config.split, limit=limit)
+
+    def build_batch(
+        self,
+        config: RunConfig,
+        examples: tuple[BenchmarkExample, ...],
+        *,
+        max_length: int | None = None,
+        context_length_policy: str = "truncate",
+    ) -> TokenizedBenchmarkBatch:
+        return build_tokenized_batch(
+            config,
+            examples,
+            self.tokenizer,
+            max_length=max_length,
+            context_length_policy=context_length_policy,
+        )
+
+    def reference_forward(
+        self,
+        batch: TokenizedBenchmarkBatch,
+        *,
+        block_ids: tuple[str, ...] | None = None,
+    ) -> ReferenceBatchOutput:
+        resolved_block_ids = block_ids or _default_block_ids(self.num_layers)
+        logits: list[tuple[float, ...]] = []
+        losses: list[float | None] = []
+        predictions: list[int] = []
+
+        active_lengths = tuple(sum(mask_row) for mask_row in batch.attention_mask)
+        token_sums = tuple(
+            sum(token for token, mask in zip(row, mask_row, strict=True) if mask)
+            for row, mask_row in zip(batch.input_ids, batch.attention_mask, strict=True)
+        )
+        for token_sum, active_length, target in zip(
+            token_sums,
+            active_lengths,
+            batch.targets,
+            strict=True,
+        ):
+            row = _deterministic_logits(
+                token_sum=token_sum,
+                active_length=active_length,
+                vocab_size=self.vocab_size,
+            )
+            logits.append(row)
+            prediction = max(range(len(row)), key=row.__getitem__)
+            predictions.append(prediction)
+            losses.append(_target_loss(target=target, prediction=prediction))
+
+        hidden_states = HiddenStateBundle(
+            feature_source=self.feature_source,
+            by_block={
+                block_id: tuple(
+                    _hidden_feature(
+                        block_id=block_id,
+                        token_sum=token_sum,
+                        active_length=active_length,
+                        hidden_size=self.hidden_size,
+                    )
+                    for token_sum, active_length in zip(
+                        token_sums,
+                        active_lengths,
+                        strict=True,
+                    )
+                )
+                for block_id in resolved_block_ids
+            },
+        )
+        return ReferenceBatchOutput(
+            logits=tuple(logits),
+            losses=tuple(losses),
+            predictions=tuple(predictions),
+            hidden_states=hidden_states,
+            metadata={
+                "model": self.model_id,
+                "tokenizer": self.tokenizer.tokenizer_id,
+                "dataset": batch.metadata.dataset,
+                "split": batch.metadata.split,
+                "prompt_format": batch.metadata.prompt_format,
+                "feature_source": self.feature_source,
+                "precision": "fp16_reference",
+                "batch_size": batch.metadata.batch_size,
+            },
+        )
+
+
+class HuggingFaceTokenizer:
+    """Tokenizer wrapper exposing the local tokenizer protocol."""
+
+    def __init__(self, tokenizer: Any, tokenizer_id: str) -> None:
+        self._tokenizer = tokenizer
+        self.tokenizer_id = tokenizer_id
+        self.pad_token_id = _resolve_pad_token_id(tokenizer)
+        self.model_max_length = _resolve_model_max_length(tokenizer)
+
+    def encode(self, text: str) -> tuple[int, ...]:
+        if not isinstance(text, str):
+            raise ModelAdapterError("invalid_input", "tokenizer input must be text")
+        token_ids = self._tokenizer.encode(text, add_special_tokens=True)
+        if not isinstance(token_ids, list) or any(not isinstance(item, int) for item in token_ids):
+            raise ModelAdapterError(
+                "invalid_tokenizer_output",
+                "Hugging Face tokenizer must return integer token IDs",
+            )
+        return tuple(token_ids) or (self.pad_token_id,)
+
+
+class HuggingFaceCausalLMAdapter:
+    """Hugging Face causal-LM adapter for local Llama-family checkpoints."""
+
+    feature_source = "layer_output_pooled_shared_mha_ffn"
+
+    def __init__(
+        self,
+        *,
+        model_ref: str,
+        model_id: str,
+        tokenizer: Any,
+        hf_config: Any,
+        requested_device: str,
+        gpu_ids: tuple[int, ...],
+    ) -> None:
+        self.model_ref = model_ref
+        self.model_id = model_id
+        self.tokenizer = tokenizer
+        self.hf_config = hf_config
+        self.requested_device = requested_device
+        self.gpu_ids = gpu_ids
+        self.num_layers = _coerce_positive_int(
+            getattr(hf_config, "num_hidden_layers", None),
+            field="num_hidden_layers",
+        )
+        self.hidden_size = _coerce_positive_int(
+            getattr(hf_config, "hidden_size", None),
+            field="hidden_size",
+        )
+        self.vocab_size = _coerce_positive_int(
+            getattr(hf_config, "vocab_size", None),
+            field="vocab_size",
+        )
+        self.architecture_metadata = _make_llama_architecture_metadata(
+            model_id=model_id,
+            num_layers=self.num_layers,
+            hidden_size=self.hidden_size,
+            vocab_size=self.vocab_size,
+        )
+        self._model: Any | None = None
+        self._parameter_views: tuple[HuggingFaceParameterView, ...] = ()
+
+    def parameters(self) -> tuple[HuggingFaceParameterView, ...]:
+        self._ensure_model_loaded()
+        return self._parameter_views
+
+    def freeze_base_model(self) -> None:
+        model = self._ensure_model_loaded()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+
+    def load_examples(
+        self,
+        config: RunConfig,
+        *,
+        limit: int | None = None,
+    ) -> tuple[BenchmarkExample, ...]:
+        return load_benchmark_examples(config.dataset, split=config.split, limit=limit)
+
+    def build_batch(
+        self,
+        config: RunConfig,
+        examples: tuple[BenchmarkExample, ...],
+        *,
+        max_length: int | None = None,
+        context_length_policy: str = "truncate",
+    ) -> TokenizedBenchmarkBatch:
+        return build_tokenized_batch(
+            config,
+            examples,
+            self.tokenizer,
+            max_length=max_length,
+            context_length_policy=context_length_policy,
+        )
+
+    def reference_forward(
+        self,
+        batch: TokenizedBenchmarkBatch,
+        *,
+        block_ids: tuple[str, ...] | None = None,
+    ) -> ReferenceBatchOutput:
+        torch = _import_torch()
+        model = self._ensure_model_loaded()
+        device = next(model.parameters()).device
+        input_ids = torch.tensor(batch.input_ids, dtype=torch.long, device=device)
+        attention_mask = torch.tensor(batch.attention_mask, dtype=torch.long, device=device)
+        with torch.no_grad():
+            output = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                use_cache=False,
+            )
+        active_lengths = [max(sum(row), 1) for row in batch.attention_mask]
+        logits: list[tuple[float, ...]] = []
+        predictions: list[int] = []
+        for row_index, active_length in enumerate(active_lengths):
+            row_logits = output.logits[row_index, active_length - 1].detach().float().cpu()
+            predictions.append(int(torch.argmax(row_logits).item()))
+            logits.append(tuple(float(value) for value in row_logits.tolist()))
+
+        resolved_block_ids = block_ids or _default_block_ids(self.num_layers)
+        hidden_by_layer = _pooled_hidden_by_layer(
+            output.hidden_states,
+            attention_mask=attention_mask,
+            active_lengths=active_lengths,
+        )
+        hidden_states = HiddenStateBundle(
+            feature_source=self.feature_source,
+            by_block={
+                block_id: tuple(hidden_by_layer[_layer_index_from_block_id(block_id)])
+                for block_id in resolved_block_ids
+            },
+        )
+        return ReferenceBatchOutput(
+            logits=tuple(logits),
+            losses=tuple(None for _ in batch.examples),
+            predictions=tuple(predictions),
+            hidden_states=hidden_states,
+            metadata={
+                "model": self.model_id,
+                "tokenizer": self.tokenizer.tokenizer_id,
+                "dataset": batch.metadata.dataset,
+                "split": batch.metadata.split,
+                "prompt_format": batch.metadata.prompt_format,
+                "feature_source": self.feature_source,
+                "precision": "hf_reference",
+                "batch_size": batch.metadata.batch_size,
+            },
+        )
+
+    def _ensure_model_loaded(self) -> Any:
+        if self._model is not None:
+            return self._model
+        torch = _import_torch()
+        transformers = _import_transformers()
+        device = _resolve_torch_device(
+            torch,
+            requested_device=self.requested_device,
+            gpu_ids=self.gpu_ids,
+        )
+        dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
+        try:
+            model = transformers.AutoModelForCausalLM.from_pretrained(
+                self.model_ref,
+                local_files_only=True,
+                torch_dtype=dtype,
+            )
+        except Exception as exc:
+            raise ModelAdapterError(
+                "model_load_failed",
+                f"failed to load Hugging Face model {self.model_ref!r} from local files: {exc}",
+            ) from exc
+        model.to(device)
+        model.eval()
+        self._model = model
+        self._parameter_views = tuple(
+            HuggingFaceParameterView(name=name, parameter=parameter)
+            for name, parameter in model.named_parameters()
+        )
+        return model
+
+
+def load_model_adapter(config: RunConfig) -> Any:
+    """Load a supported local adapter or fail before expensive model work."""
+
+    model_metadata = _try_load_fake_model_metadata(config.model)
+    if model_metadata is not None:
+        tokenizer = _load_fake_tokenizer(config.tokenizer)
+        return FakeCausalLMAdapter(
+            model_id=model_metadata["model_id"],
+            tokenizer=tokenizer,
+            num_layers=model_metadata["num_layers"],
+            hidden_size=model_metadata["hidden_size"],
+            vocab_size=model_metadata["vocab_size"],
+        )
+
+    resolved_model_ref = _resolve_local_hf_ref(config.model)
+    hf_config = _load_hf_config(resolved_model_ref)
+    if getattr(hf_config, "model_type", None) != "llama":
+        raise ModelAdapterError(
+            "unsupported_model",
+            f"model {config.model!r} is not a supported fake model or Llama Hugging Face checkpoint",
+        )
+    tokenizer_ref = (
+        resolved_model_ref
+        if config.tokenizer == config.model
+        else _resolve_local_hf_ref(config.tokenizer)
+    )
+    tokenizer = _load_any_tokenizer(tokenizer_ref, tokenizer_id=config.tokenizer)
+    return HuggingFaceCausalLMAdapter(
+        model_ref=resolved_model_ref,
+        model_id=config.model,
+        tokenizer=tokenizer,
+        hf_config=hf_config,
+        requested_device=config.device,
+        gpu_ids=config.gpu_ids,
+    )
+
+
+def _load_fake_tokenizer(tokenizer_id: str) -> FakeTokenizer:
+    if _is_fake_identifier(tokenizer_id):
+        return FakeTokenizer(tokenizer_id)
+
+    path = Path(tokenizer_id)
+    if not path.is_file():
+        raise ModelAdapterError(
+            "tokenizer_unavailable",
+            f"tokenizer {tokenizer_id!r} is not a supported fake tokenizer or readable metadata file",
+        )
+    metadata = _read_json_metadata(path, kind="tokenizer")
+    if metadata.get("type") != "fake_tokenizer":
+        raise ModelAdapterError(
+            "unsupported_tokenizer",
+            f"tokenizer metadata {path} is not type fake_tokenizer",
+        )
+    return FakeTokenizer(
+        str(metadata.get("tokenizer_id", path)),
+        model_max_length=_coerce_positive_int(
+            metadata.get("model_max_length", 128),
+            field="model_max_length",
+        ),
+    )
+
+
+def _load_any_tokenizer(tokenizer_ref: str, *, tokenizer_id: str | None = None) -> Any:
+    tokenizer_id = tokenizer_id or tokenizer_ref
+    try:
+        return _load_fake_tokenizer(tokenizer_ref)
+    except ModelAdapterError:
+        pass
+    transformers = _import_transformers()
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+            tokenizer_ref,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise ModelAdapterError(
+            "tokenizer_unavailable",
+            f"tokenizer {tokenizer_id!r} is not a supported fake tokenizer or local Hugging Face tokenizer: {exc}",
+        ) from exc
+    return HuggingFaceTokenizer(tokenizer, tokenizer_id)
+
+
+def _try_load_fake_model_metadata(model_id: str) -> dict[str, Any] | None:
+    if _is_fake_identifier(model_id):
+        return {
+            "model_id": model_id,
+            "num_layers": 2,
+            "hidden_size": 4,
+            "vocab_size": 8,
+        }
+
+    path = Path(model_id)
+    if not path.is_file():
+        return None
+    metadata = _read_json_metadata(path, kind="model")
+    if metadata.get("type") != "fake_causal_lm":
+        return None
+    return {
+        "model_id": str(metadata.get("model_id", path)),
+        "num_layers": _coerce_positive_int(metadata.get("num_layers", 2), field="num_layers"),
+        "hidden_size": _coerce_positive_int(metadata.get("hidden_size", 4), field="hidden_size"),
+        "vocab_size": _coerce_positive_int(metadata.get("vocab_size", 8), field="vocab_size"),
+    }
+
+
+def _load_hf_config(model_ref: str) -> Any:
+    path = Path(model_ref)
+    if path.is_file():
+        metadata = _read_json_metadata(path, kind="model")
+        return _DictConfig(metadata)
+    config_path = path / "config.json" if path.is_dir() else None
+    if config_path is not None and config_path.is_file():
+        metadata = _read_json_metadata(config_path, kind="model")
+        return _DictConfig(metadata)
+    transformers = _import_transformers()
+    try:
+        return transformers.AutoConfig.from_pretrained(
+            model_ref,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise ModelAdapterError(
+            "model_unavailable",
+            f"model {model_ref!r} is not a supported fake model or local Hugging Face config: {exc}",
+        ) from exc
+
+
+def _resolve_local_hf_ref(model_ref: str) -> str:
+    path = Path(model_ref)
+    if path.exists():
+        return str(path)
+    if "/" not in model_ref:
+        return model_ref
+    namespace, name = model_ref.split("/", 1)
+    cache_root = Path.home() / ".cache" / "huggingface" / "hub"
+    repo_root = cache_root / f"models--{namespace}--{name}"
+    refs_main = repo_root / "refs" / "main"
+    if refs_main.is_file():
+        snapshot = repo_root / "snapshots" / refs_main.read_text(encoding="utf-8").strip()
+        if snapshot.is_dir():
+            return str(snapshot)
+    snapshots = repo_root / "snapshots"
+    if snapshots.is_dir():
+        candidates = sorted(path for path in snapshots.iterdir() if path.is_dir())
+        if candidates:
+            return str(candidates[-1])
+    return model_ref
+
+
+class _DictConfig:
+    def __init__(self, value: dict[str, Any]) -> None:
+        self._value = value
+
+    def __getattr__(self, name: str) -> Any:
+        try:
+            return self._value[name]
+        except KeyError as exc:
+            raise AttributeError(name) from exc
+
+
+def _read_json_metadata(path: Path, *, kind: str) -> dict[str, Any]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ModelAdapterError(f"{kind}_metadata_read_failed", str(exc)) from exc
+    if not isinstance(raw, dict):
+        raise ModelAdapterError(
+            f"invalid_{kind}_metadata",
+            f"{kind} metadata must be a JSON object",
+        )
+    return raw
+
+
+def _coerce_positive_int(value: Any, *, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ModelAdapterError(
+            "invalid_model_metadata",
+            f"{field} must be a positive integer",
+        )
+    return value
+
+
+def _is_fake_identifier(value: str) -> bool:
+    return value.startswith("fake-") or value.startswith("fake_")
+
+
+def _make_fake_architecture_metadata(
+    *,
+    model_id: str,
+    num_layers: int,
+    hidden_size: int,
+    vocab_size: int,
+) -> FakeModelArchitectureMetadata:
+    return FakeModelArchitectureMetadata(
+        model_id=model_id,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        layers=tuple(
+            FakeArchitectureLayer(
+                mha=FakeArchitectureBlock(
+                    tensor_names=(
+                        f"layers.{layer_index}.mha.q_proj.weight",
+                        f"layers.{layer_index}.mha.o_proj.weight",
+                    )
+                ),
+                ffn=FakeArchitectureBlock(
+                    tensor_names=(
+                        f"layers.{layer_index}.ffn.gate_proj.weight",
+                        f"layers.{layer_index}.ffn.down_proj.weight",
+                    )
+                ),
+            )
+            for layer_index in range(num_layers)
+        ),
+    )
+
+
+def _make_llama_architecture_metadata(
+    *,
+    model_id: str,
+    num_layers: int,
+    hidden_size: int,
+    vocab_size: int,
+) -> FakeModelArchitectureMetadata:
+    return FakeModelArchitectureMetadata(
+        model_id=model_id,
+        hidden_size=hidden_size,
+        vocab_size=vocab_size,
+        framework="transformers_llama",
+        layers=tuple(
+            FakeArchitectureLayer(
+                mha=FakeArchitectureBlock(
+                    tensor_names=(
+                        f"model.layers.{layer_index}.self_attn.q_proj.weight",
+                        f"model.layers.{layer_index}.self_attn.k_proj.weight",
+                        f"model.layers.{layer_index}.self_attn.v_proj.weight",
+                        f"model.layers.{layer_index}.self_attn.o_proj.weight",
+                    )
+                ),
+                ffn=FakeArchitectureBlock(
+                    tensor_names=(
+                        f"model.layers.{layer_index}.mlp.gate_proj.weight",
+                        f"model.layers.{layer_index}.mlp.up_proj.weight",
+                        f"model.layers.{layer_index}.mlp.down_proj.weight",
+                    )
+                ),
+            )
+            for layer_index in range(num_layers)
+        ),
+    )
+
+
+def _default_block_ids(num_layers: int) -> tuple[str, ...]:
+    return tuple(
+        block_id
+        for layer_index in range(num_layers)
+        for block_id in (f"layer_{layer_index:03d}.mha", f"layer_{layer_index:03d}.ffn")
+    )
+
+
+def _deterministic_logits(
+    *,
+    token_sum: int,
+    active_length: int,
+    vocab_size: int,
+) -> tuple[float, ...]:
+    return tuple(
+        round(((token_sum + (index + 1) * active_length) % 997) / 997.0, 6)
+        for index in range(vocab_size)
+    )
+
+
+def _target_loss(*, target: str | None, prediction: int) -> float | None:
+    if target is None:
+        return None
+    target_score = sum(ord(character) for character in target) % 17
+    return round(abs(target_score - prediction) / 17.0, 6)
+
+
+def _hidden_feature(
+    *,
+    block_id: str,
+    token_sum: int,
+    active_length: int,
+    hidden_size: int,
+) -> tuple[float, ...]:
+    block_score = sum(ord(character) for character in block_id)
+    return tuple(
+        round(((token_sum + block_score + (offset + 1) * active_length) % 101) / 100.0, 6)
+        for offset in range(hidden_size)
+    )
+
+
+def _resolve_pad_token_id(tokenizer: Any) -> int:
+    pad_token_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_token_id is not None:
+        return int(pad_token_id)
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is not None:
+        return int(eos_token_id)
+    return 0
+
+
+def _resolve_model_max_length(tokenizer: Any) -> int:
+    value = getattr(tokenizer, "model_max_length", 0)
+    if not isinstance(value, int) or value <= 0 or value > 1_000_000:
+        return 4096
+    return value
+
+
+def _import_transformers() -> Any:
+    try:
+        import transformers
+    except ImportError as exc:
+        raise ModelAdapterError(
+            "transformers_unavailable",
+            "Hugging Face model loading requires the optional transformers package",
+        ) from exc
+    return transformers
+
+
+def _import_torch() -> Any:
+    try:
+        import torch
+    except ImportError as exc:
+        raise ModelAdapterError(
+            "torch_unavailable",
+            "Hugging Face model execution requires the optional torch package",
+        ) from exc
+    return torch
+
+
+def _resolve_torch_device(
+    torch: Any,
+    *,
+    requested_device: str,
+    gpu_ids: tuple[int, ...],
+) -> Any:
+    if requested_device == "cpu":
+        return torch.device("cpu")
+    if requested_device == "cuda":
+        if not torch.cuda.is_available():
+            raise ModelAdapterError(
+                "cuda_unavailable",
+                "config requested cuda but torch.cuda.is_available() is false",
+            )
+        gpu_id = gpu_ids[0] if gpu_ids else 0
+        return torch.device(f"cuda:{gpu_id}")
+    raise ModelAdapterError(
+        "unsupported_device",
+        "Hugging Face adapter supports only cpu or cuda devices",
+    )
+
+
+def _pooled_hidden_by_layer(
+    hidden_states: Any,
+    *,
+    attention_mask: Any,
+    active_lengths: list[int],
+) -> tuple[tuple[tuple[float, ...], ...], ...]:
+    # Hidden states are exposed per transformer layer, not separately for MHA and
+    # FFN. The router training docs record the shared per-layer feature assumption.
+    result: list[tuple[tuple[float, ...], ...]] = []
+    for layer_hidden in hidden_states[1:]:
+        rows = []
+        for row_index, active_length in enumerate(active_lengths):
+            values = layer_hidden[row_index, :active_length].detach().float()
+            mask = attention_mask[row_index, :active_length].detach().float().unsqueeze(-1)
+            pooled = (values * mask).sum(dim=0) / mask.sum().clamp_min(1.0)
+            rows.append(tuple(float(value) for value in pooled.cpu().tolist()))
+        result.append(tuple(rows))
+    return tuple(result)
+
+
+def _layer_index_from_block_id(block_id: str) -> int:
+    try:
+        layer_part, _ = block_id.split(".", 1)
+        return int(layer_part.removeprefix("layer_"))
+    except (ValueError, AttributeError) as exc:
+        raise ModelAdapterError(
+            "invalid_block_id",
+            f"cannot derive layer index from block_id {block_id!r}",
+        ) from exc

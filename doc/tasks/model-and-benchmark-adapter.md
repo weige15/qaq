@@ -1,0 +1,45 @@
+# Model and Benchmark Adapter
+
+## Goal
+
+Implement a model and benchmark adapter that loads the causal LLM/tokenizer, creates comparable benchmark inputs, exposes FP16/reference execution, and returns hidden features for router decisions.
+
+## Inputs
+
+- `doc/proposal.md`: Baselines and router training require full-precision teacher/reference behavior and benchmark-compatible evaluation.
+- `doc/high-level-design.md`: The adapter owns model/tokenizer references, benchmark prompt/tokenization behavior, and frozen base model execution for router training.
+- `doc/detailed-design.md`: Defines tokenized batches, hidden-state bundles keyed by block ID, model architecture metadata, and benchmark comparability rules.
+- `doc/test-plan.md`: Requires smoke E2E, public/sample validation, edge-case validation, and performance tests using shared checkpoint, tokenizer, prompt format, and metric code.
+
+## Write Scope
+
+Create or edit proposed paths: `qaq/model_adapter.py`, `qaq/benchmark_adapter.py`, `qaq/data.py`, `tests/integration/test_model_adapter_smoke.py`, and benchmark fixtures under `tests/fixtures/`.
+
+## Read Scope
+
+Inspect config and manifest APIs, block registry interfaces, router feature requirements, and any selected model/evaluation library documentation.
+
+## Dependencies
+
+Experiment Configuration and Run Manifest. Coordinate model metadata with Block Registry and Precision Plan. External dependency choice for model loading and benchmark datasets must be approved before full implementation.
+
+## Tasks
+
+- [x] Implement tokenizer and model loading from validated config, with explicit errors for missing or inaccessible checkpoints.
+- [x] Implement benchmark example loading/tokenization with recorded dataset, split, prompt format, batch size, and context-length policy.
+- [x] Expose FP16/reference execution outputs needed by static baselines, router training, and evaluation metrics.
+- [x] Expose hidden representations at a documented feature point for each controlled block.
+- [x] Provide model architecture metadata to the Block Registry without leaking framework-specific details into downstream modules.
+- [x] Add fake-model or tiny-model adapter tests that do not require LLaMA-3.1-8B or GPU access.
+
+## Tests and Quality Gates
+
+- [x] Run `pytest -q tests/integration/test_model_adapter_smoke.py` when implemented.
+- [x] Verify tokenizer, prompt format, dataset split, and context policy are recorded in run metadata.
+- [x] Verify unsupported model architecture or unavailable dataset fails clearly.
+
+## Done When
+
+- [x] The adapter can run a fake or tiny model reference pass and return logits/losses plus hidden features.
+- [x] Benchmark examples are tokenized consistently across modes.
+- [x] Adapter smoke tests pass without requiring full paper-scale checkpoints.

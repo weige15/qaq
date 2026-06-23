@@ -1,0 +1,34 @@
+model: meta-llama/Llama-3.1-8B
+tokenizer: meta-llama/Llama-3.1-8B
+data_source: tests/fixtures/benchmarks/router_training_real.jsonl
+split: train
+validation_split: validation
+teacher_model: meta-llama/Llama-3.1-8B
+student_model: meta-llama/Llama-3.1-8B
+student_quantized_path: runs/llama31_8b_bitplanes_sampled/artifact_index.json
+distillation_loss: router_cost_cross_entropy
+precision_candidates: [4, 8]
+max_bit_width: 8
+block_granularity: mha_ffn
+device: cuda
+gpu_ids: [0]
+seed: 0
+output_dir: runs/router_train_llama31_8b_sampled
+overwrite: true
+prompt_format: question_answer_v1
+training_data_limit: 1
+validation_data_limit: 1
+checkpoint_interval_steps: 1
+diagnostic: false
+router:
+  learning_rate: 0.02
+  max_steps: 1
+  temperature: 1.0
+  target_temperature: 0.2
+  bit_cost_weight: 0.04
+  decision_policy: argmax_lowest_bit_width
+logging:
+  progress_interval_steps: 1
+  checkpoint_interval_steps: 1
+  console: true
+  log_dir: runs/router_train_llama31_8b_sampled/logs

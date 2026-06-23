@@ -1,0 +1,18 @@
+{
+  "layer_000.ffn": {
+    "4": "tests/fixtures/bitplanes/router_training_real/layer_000.ffn.json",
+    "8": "tests/fixtures/bitplanes/router_training_real/layer_000.ffn.json"
+  },
+  "layer_000.mha": {
+    "4": "tests/fixtures/bitplanes/router_training_real/layer_000.mha.json",
+    "8": "tests/fixtures/bitplanes/router_training_real/layer_000.mha.json"
+  },
+  "layer_001.ffn": {
+    "4": "tests/fixtures/bitplanes/router_training_real/layer_001.ffn.json",
+    "8": "tests/fixtures/bitplanes/router_training_real/layer_001.ffn.json"
+  },
+  "layer_001.mha": {
+    "4": "tests/fixtures/bitplanes/router_training_real/layer_001.mha.json",
+    "8": "tests/fixtures/bitplanes/router_training_real/layer_001.mha.json"
+  }
+}

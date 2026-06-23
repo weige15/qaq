@@ -1,0 +1,25 @@
+{
+  "model": "meta-llama/Llama-3.1-8B",
+  "use_model_tokenizer": true,
+  "dataset": "wikitext",
+  "split": "test",
+  "mode": "fp16",
+  "precision_candidates": [4, 8],
+  "max_bit_width": 8,
+  "block_granularity": "mha_ffn",
+  "device": "cuda",
+  "gpu_ids": [0],
+  "seed": 0,
+  "output_dir": "runs/llama31_8b_first_milestone",
+  "overwrite": false,
+  "logging": {
+    "progress_interval_steps": 10,
+    "checkpoint_interval_steps": 500,
+    "console": true,
+    "log_dir": "runs/llama31_8b_first_milestone/logs"
+  },
+  "prompt_format": "paper_aligned_default",
+  "metric": "perplexity",
+  "notes": "Stub for the first milestone; runtime, datasets, artifacts, and model access are validated by later workstreams."
+}
+

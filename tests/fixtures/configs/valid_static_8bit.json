@@ -1,0 +1,20 @@
+{
+  "model": "fake-model",
+  "tokenizer": "fake-tokenizer",
+  "dataset": "toy_prompts",
+  "split": "validation",
+  "mode": "static_8bit",
+  "precision_candidates": [4, 8],
+  "max_bit_width": 8,
+  "block_granularity": "mha_ffn",
+  "gpu_ids": [0],
+  "seed": 123,
+  "output_dir": "runs/test-fixture/static-8bit",
+  "overwrite": false,
+  "logging": {
+    "progress_interval_steps": 5,
+    "checkpoint_interval_steps": 50,
+    "console": false,
+    "log_dir": "runs/test-fixture/logs"
+  }
+}

@@ -1,0 +1,32 @@
+model: fake-qaq-smoke-model
+tokenizer: fake-qaq-smoke-tokenizer
+data_source: fake_smoke
+split: validation
+teacher_model: fake-qaq-smoke-model
+student_model: fake-qaq-smoke-model
+student_quantized_path: runs/router_train_health/health_artifacts
+distillation_loss: router_cost_cross_entropy
+precision_candidates: [4, 8]
+max_bit_width: 8
+block_granularity: mha_ffn
+device: cpu
+gpu_ids: []
+seed: 0
+output_dir: runs/router_train_health
+overwrite: true
+prompt_format: fake_smoke_v1
+training_data_limit: 2
+checkpoint_interval_steps: 1
+diagnostic: true
+router:
+  learning_rate: 0.1
+  max_steps: 2
+  temperature: 1.0
+  target_temperature: 0.25
+  bit_cost_weight: 0.02
+  decision_policy: argmax_lowest_bit_width
+logging:
+  progress_interval_steps: 1
+  checkpoint_interval_steps: 1
+  console: false
+  log_dir: runs/router_train_health/logs

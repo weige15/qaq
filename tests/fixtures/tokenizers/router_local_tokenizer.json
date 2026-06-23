@@ -1,0 +1,5 @@
+{
+  "type": "fake_tokenizer",
+  "tokenizer_id": "router-local-tokenizer",
+  "model_max_length": 128
+}

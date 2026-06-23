@@ -1,0 +1,7 @@
+{
+  "type": "fake_causal_lm",
+  "model_id": "router-local-model",
+  "num_layers": 2,
+  "hidden_size": 4,
+  "vocab_size": 8
+}

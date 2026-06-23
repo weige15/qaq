@@ -1,0 +1,16 @@
+{
+  "model": "fake-qaq-smoke-model",
+  "tokenizer": "fake-qaq-smoke-tokenizer",
+  "dataset": "fake_smoke",
+  "split": "validation",
+  "mode": "adaptive_magic",
+  "precision_candidates": [4, 8],
+  "max_bit_width": 8,
+  "block_granularity": "mha_ffn",
+  "device": "cpu",
+  "gpu_ids": [],
+  "seed": 0,
+  "output_dir": "runs/test-smoke",
+  "overwrite": false
+}
+

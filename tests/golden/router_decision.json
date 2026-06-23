@@ -1,0 +1,13 @@
+{
+  "decision_policy": "argmax_lowest_bit_width",
+  "probabilities": {
+    "4": 0.5,
+    "8": 0.5
+  },
+  "raw_scores": {
+    "4": 0.0,
+    "8": 0.0
+  },
+  "selected_bit_width": 4,
+  "tie_break_applied": true
+}

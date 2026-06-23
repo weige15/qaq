@@ -1,0 +1,64 @@
+{
+  "block_granularity": "mha_ffn",
+  "completion_status": "completed",
+  "constrained": false,
+  "dataset": "HellaSwag",
+  "diagnostic": false,
+  "gpu_ids": [
+    0
+  ],
+  "hardware": {
+    "gpu_model": "NVIDIA GeForce RTX 3090",
+    "selected_gpu_ids": [
+      0
+    ]
+  },
+  "latency_seconds": 1.25,
+  "loader_summary": null,
+  "log_events": [],
+  "log_paths": {
+    "eval_log": "runs/static_8bit/eval.jsonl"
+  },
+  "max_bit_width": 8,
+  "metadata": {},
+  "metric": "exact_match",
+  "metrics": {
+    "latency": {
+      "end_to_end_seconds": 1.25,
+      "event_count": 1,
+      "events": []
+    },
+    "memory": {
+      "event_count": 1,
+      "events": [],
+      "peak_gpu_memory_gb": 10.5
+    },
+    "quality": {
+      "average_loss": null,
+      "higher_is_better": true,
+      "metric_name": "exact_match",
+      "num_examples": 2,
+      "perplexity": null,
+      "primary_value": 0.75,
+      "score": 0.75,
+      "source": "fixture"
+    }
+  },
+  "mode": "static_8bit",
+  "model": "LLaMA-3.1-8B",
+  "notes": [],
+  "peak_gpu_memory_gb": 10.5,
+  "perplexity": null,
+  "precision_candidates": [
+    4,
+    8
+  ],
+  "prompt_format": "hellaswag_v1",
+  "result_id": "LLaMA-3.1-8B:HellaSwag:validation:static_8bit:seed7",
+  "routing_summary": null,
+  "schema_version": "qaq.result.v1",
+  "score": 0.75,
+  "seed": 7,
+  "split": "validation",
+  "tokenizer": "LLaMA-3.1-8B"
+}
