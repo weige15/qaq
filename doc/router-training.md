@@ -69,26 +69,32 @@ A full Llama 3.1 8B router-training command additionally requires:
 If those artifacts or local Hugging Face files are absent, the run must fail clearly instead of falling back to fake/local metadata.
 
 The current router trainer intentionally performs a CUDA capacity preflight
-before loading Hugging Face weights. The implementation creates separate
-teacher and student adapters, so a same-model Llama 3.1 8B run requires roughly
-two copies of the BF16 model weights before activation memory. On the currently
-visible single RTX 4050 Laptop GPU, the reproducible Llama sampled-artifact
-training command is expected to fail before model loading:
+before loading Hugging Face weights. When `teacher_model` and `student_model`
+are the same exact model reference, the trainer uses a shared frozen reference
+adapter and reuses the teacher forward output as the student reference output.
+This is valid for the current minimal objective because quantized-student
+effects enter through bit-plane artifact reconstruction distortion rather than
+through a separately executed quantized transformer. Distinct teacher and
+student model references still use separate adapters and separate reference
+forwards.
+
+On the currently visible single RTX 4050 Laptop GPU, the reproducible Llama
+sampled-artifact training command is expected to fail before model loading:
 
 ```bash
 python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml
 ```
 
-Observed escalated preflight result on 2026-06-24:
+Observed escalated preflight result after the shared-reference change on
+2026-06-24:
 
 ```text
-insufficient_cuda_memory: requires at least 30.42 GiB free before activations; cuda:0 reports 4.96 GiB free of 6.00 GiB total
+insufficient_cuda_memory: requires at least 15.46 GiB free before activations; cuda:0 reports 4.96 GiB free of 6.00 GiB total
 ```
 
 This is a hardware/capacity blocker, not a router objective or artifact
 compatibility failure. Do not report this Llama command as a successful training
-run until it completes on a sufficiently large GPU setup or the trainer is
-changed to a real shared/sequential teacher-student execution path.
+run until it completes on a sufficiently large GPU setup.
 
 ## Llama Bit-Plane Artifact Preparation
 

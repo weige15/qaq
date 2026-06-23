@@ -23,7 +23,7 @@ from qaq.config import LoggingConfig, RunConfig
 from qaq.data import BenchmarkDataError, load_benchmark_examples
 from qaq.logging import JsonlLogWriter, LogEvent, open_run_log
 from qaq.manifest import RunManifest, create_run_manifest
-from qaq.model_adapter import FakeCausalLMAdapter, load_model_adapter
+from qaq.model_adapter import load_model_adapter
 from qaq.progress import ConsoleProgressMonitor, ProgressState, TimingMeasurement
 from qaq.quantization import flatten_tensor
 from qaq.router.checkpoint import RouterCheckpoint, save_router_checkpoint
@@ -336,6 +336,13 @@ class CudaMemoryInfo:
     total_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class ReferenceAdapters:
+    teacher: Any
+    student: Any
+    shared_reference: bool
+
+
 def load_router_training_config(path: str | Path) -> RouterTrainingConfig:
     """Load a JSON, TOML, or small YAML router-training config."""
 
@@ -364,6 +371,30 @@ def load_router_training_config(path: str | Path) -> RouterTrainingConfig:
             "top-level config must be an object",
         )
     return RouterTrainingConfig.from_mapping(raw)
+
+
+def _load_reference_adapters(config: RouterTrainingConfig) -> ReferenceAdapters:
+    teacher = load_model_adapter(
+        config.to_run_config(model=config.teacher_model, validate_output=False)
+    )
+    if _uses_shared_reference_adapter(config):
+        return ReferenceAdapters(
+            teacher=teacher,
+            student=teacher,
+            shared_reference=True,
+        )
+    student = load_model_adapter(
+        config.to_run_config(model=config.student_model, validate_output=False)
+    )
+    return ReferenceAdapters(
+        teacher=teacher,
+        student=student,
+        shared_reference=False,
+    )
+
+
+def _uses_shared_reference_adapter(config: RouterTrainingConfig) -> bool:
+    return config.teacher_model == config.student_model
 
 
 def validate_router_training_preflight(config: RouterTrainingConfig) -> None:
@@ -434,18 +465,13 @@ def validate_router_training_preflight(config: RouterTrainingConfig) -> None:
     except BenchmarkDataError as exc:
         raise RouterTrainingError("training_data_unavailable", str(exc)) from exc
 
-    teacher = load_model_adapter(
-        config.to_run_config(model=config.teacher_model, validate_output=False)
-    )
-    student = load_model_adapter(
-        config.to_run_config(model=config.student_model, validate_output=False)
-    )
+    adapters = _load_reference_adapters(config)
     blocks = discover_mha_ffn_blocks(
-        teacher.architecture_metadata,
+        adapters.teacher.architecture_metadata,
         supported_bit_widths=config.precision_candidates,
     )
     student_blocks = discover_mha_ffn_blocks(
-        student.architecture_metadata,
+        adapters.student.architecture_metadata,
         supported_bit_widths=config.precision_candidates,
     )
     if tuple(block.block_id for block in blocks) != tuple(
@@ -455,7 +481,12 @@ def validate_router_training_preflight(config: RouterTrainingConfig) -> None:
             "teacher_student_block_mismatch",
             "teacher and student block IDs must match",
         )
-    _validate_cuda_training_capacity(config, teacher=teacher, student=student)
+    _validate_cuda_training_capacity(
+        config,
+        teacher=adapters.teacher,
+        student=adapters.student,
+        shared_reference=adapters.shared_reference,
+    )
     _load_quantized_artifacts(config, blocks)
 
 
@@ -522,7 +553,10 @@ def _run_router_training_started(
         message="router training started",
         total_examples=config.training_data_limit,
         selected_gpu_ids=config.gpu_ids,
-        details={"router_training_config": config.as_dict()},
+        details={
+            "router_training_config": config.as_dict(),
+            "shared_teacher_student_reference": _uses_shared_reference_adapter(config),
+        },
     )
     writer.record(start_event)
     monitor.handle(start_event)
@@ -536,14 +570,12 @@ def _run_router_training_started(
         writer.record(warning_event)
         monitor.handle(warning_event)
 
-    teacher = load_model_adapter(
-        config.to_run_config(model=config.teacher_model, validate_output=False)
-    )
-    student = load_model_adapter(
-        config.to_run_config(model=config.student_model, validate_output=False)
-    )
+    adapters = _load_reference_adapters(config)
+    teacher = adapters.teacher
+    student = adapters.student
     _freeze_and_validate(teacher)
-    _freeze_and_validate(student)
+    if not adapters.shared_reference:
+        _freeze_and_validate(student)
 
     blocks = discover_mha_ffn_blocks(
         teacher.architecture_metadata,
@@ -575,7 +607,11 @@ def _run_router_training_started(
     batch = teacher.build_batch(run_config, examples)
     block_ids = tuple(block.block_id for block in blocks)
     teacher_output = teacher.reference_forward(batch, block_ids=block_ids)
-    student_output = student.reference_forward(batch, block_ids=block_ids)
+    student_output = (
+        teacher_output
+        if adapters.shared_reference
+        else student.reference_forward(batch, block_ids=block_ids)
+    )
     training_targets = _build_router_targets(
         config,
         example_ids=batch.example_ids,
@@ -607,9 +643,13 @@ def _run_router_training_started(
             validation_batch,
             block_ids=block_ids,
         )
-        validation_student_output = student.reference_forward(
-            validation_batch,
-            block_ids=block_ids,
+        validation_student_output = (
+            validation_teacher_output
+            if adapters.shared_reference
+            else student.reference_forward(
+                validation_batch,
+                block_ids=block_ids,
+            )
         )
         validation_targets = _build_router_targets(
             config,
@@ -773,7 +813,7 @@ def _run_router_training_started(
 def _initial_checkpoint(
     config: RouterTrainingConfig,
     *,
-    adapter: FakeCausalLMAdapter,
+    adapter: Any,
     block_ids: tuple[str, ...],
     completed_step: int,
     latest_loss: LossRecord | None,
@@ -1125,6 +1165,7 @@ def _save_target_audit(
         "bit_cost_weight": config.router.bit_cost_weight,
         "target_temperature": config.router.target_temperature,
         "diagnostic_training": config.diagnostic,
+        "shared_teacher_student_reference": _uses_shared_reference_adapter(config),
         "training_targets": [_target_as_dict(target) for target in training_targets],
         "validation_targets": [_target_as_dict(target) for target in validation_targets],
     }
@@ -1256,6 +1297,7 @@ def _validate_cuda_training_capacity(
     *,
     teacher: Any,
     student: Any,
+    shared_reference: bool,
 ) -> None:
     if config.device != "cuda":
         return
@@ -1281,20 +1323,26 @@ def _validate_cuda_training_capacity(
     if teacher_bytes is None or student_bytes is None:
         return
 
-    required_bytes = teacher_bytes + student_bytes + CUDA_MODEL_LOAD_MARGIN_BYTES
+    required_weight_bytes = teacher_bytes if shared_reference else teacher_bytes + student_bytes
+    required_bytes = required_weight_bytes + CUDA_MODEL_LOAD_MARGIN_BYTES
     if required_bytes > memory.free_bytes:
+        execution_path = (
+            "shared teacher/student model-weight loading path"
+            if shared_reference
+            else "teacher+student model-weight loading path"
+        )
         raise RouterTrainingError(
             "insufficient_cuda_memory",
             "router training requires at least "
             f"{_bytes_to_gib(required_bytes):.2f} GiB of free CUDA memory for "
-            "the current teacher+student model-weight loading path before "
+            f"the current {execution_path} before "
             f"activations, but cuda:{gpu_id} reports "
             f"{_bytes_to_gib(memory.free_bytes):.2f} GiB free "
             f"of {_bytes_to_gib(memory.total_bytes):.2f} GiB total. "
             f"teacher_model_weight={_bytes_to_gib(teacher_bytes):.2f} GiB, "
             f"student_model_weight={_bytes_to_gib(student_bytes):.2f} GiB. "
-            "Use a GPU with enough memory or implement shared/sequential "
-            "teacher-student execution before running this config.",
+            "Use a GPU with enough memory or reduce reference execution memory "
+            "before running this config.",
         )
 
 
@@ -1423,6 +1471,12 @@ def _training_metadata(
         "distillation_loss": config.distillation_loss,
         "objective": config.distillation_loss,
         "objective_assumption": ROUTER_COST_CROSS_ENTROPY,
+        "shared_teacher_student_reference": _uses_shared_reference_adapter(config),
+        "reference_execution": (
+            "shared_teacher_student_forward"
+            if _uses_shared_reference_adapter(config)
+            else "separate_teacher_student_forwards"
+        ),
         "learning_rate": config.router.learning_rate,
         "target_temperature": config.router.target_temperature,
         "bit_cost_weight": config.router.bit_cost_weight,
@@ -1469,7 +1523,7 @@ def _save_checkpoint(
     return checkpoint_path
 
 
-def _freeze_and_validate(adapter: FakeCausalLMAdapter) -> None:
+def _freeze_and_validate(adapter: Any) -> None:
     adapter.freeze_base_model()
     trainable = tuple(
         parameter.name for parameter in adapter.parameters() if parameter.requires_grad

@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+from qaq.artifacts import save_bitplane_artifact
+from qaq.bitplanes import create_bitplane_artifact_from_quantized_values
 from qaq.blocks import discover_mha_ffn_blocks
 from qaq.config import RunConfig
 from qaq.evaluate import main as evaluate_main
@@ -235,6 +237,8 @@ def test_router_training_real_data_acceptance_writes_reloadable_checkpoint_and_e
     assert loaded.metadata.training_metadata["target_record_count"] == 12
     assert loaded.metadata.training_metadata["distillation_loss"] == "router_cost_cross_entropy"
     assert loaded.metadata.training_metadata["diagnostic_training"] is False
+    assert loaded.metadata.training_metadata["shared_teacher_student_reference"] is True
+    assert loaded.metadata.training_metadata["reference_execution"] == "shared_teacher_student_forward"
     assert loaded.metadata.training_metadata["parameter_update_l2"] > 0
     assert loaded.metadata.training_metadata["latest_validation_metrics"]["validation_loss"] > 0
     assert any(
@@ -246,6 +250,7 @@ def test_router_training_real_data_acceptance_writes_reloadable_checkpoint_and_e
     target_audit = json.loads(result.target_audit_path.read_text(encoding="utf-8"))
     assert target_audit["objective"] == "router_cost_cross_entropy"
     assert target_audit["diagnostic_training"] is False
+    assert target_audit["shared_teacher_student_reference"] is True
     assert target_audit["training_data_source"] == training_config.data_source
     assert target_audit["training_sample_count"] == 3
     assert target_audit["validation_sample_count"] == 2
@@ -452,9 +457,93 @@ def test_router_training_cuda_preflight_rejects_insufficient_llama_memory(
         validate_router_training_preflight(training_config)
 
     assert exc.value.code == "insufficient_cuda_memory"
-    assert "teacher+student model-weight loading path" in exc.value.message
+    assert "shared teacher/student model-weight loading path" in exc.value.message
     assert "teacher_model_weight=16.00 GiB" in exc.value.message
     assert "cuda:0 reports 6.00 GiB free" in exc.value.message
+
+
+def test_router_training_cuda_preflight_counts_shared_llama_reference_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_dir = tmp_path / "llama"
+    model_dir.mkdir()
+    tokenizer_path = tmp_path / "tokenizer.json"
+    model_dir.joinpath("config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 1,
+                "hidden_size": 4,
+                "vocab_size": 16,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer_path.write_text(
+        json.dumps(
+            {
+                "type": "fake_tokenizer",
+                "tokenizer_id": "tiny-llama-tokenizer",
+                "model_max_length": 16,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_dir.joinpath("model.safetensors.index.json").write_text(
+        json.dumps({"metadata": {"total_size": 16 * 1024**3}, "weight_map": {}}),
+        encoding="utf-8",
+    )
+    artifact_dir = tmp_path / "artifacts"
+    for block_id, tensor_name in (
+        ("layer_000.mha", "model.layers.0.self_attn.q_proj.weight"),
+        ("layer_000.ffn", "model.layers.0.mlp.gate_proj.weight"),
+    ):
+        artifact = create_bitplane_artifact_from_quantized_values(
+            [[0, 255], [16, 240]],
+            model_id=str(model_dir),
+            block_id=block_id,
+            tensor_name=tensor_name,
+            max_bit_width=8,
+            checkpoint_ref="shared-preflight-test",
+            compatibility={"block_granularity": "mha_ffn"},
+        )
+        save_bitplane_artifact(artifact, artifact_dir / f"{block_id}.json")
+    monkeypatch.setattr(
+        router_train_module,
+        "_cuda_memory_info",
+        lambda gpu_id: router_train_module.CudaMemoryInfo(
+            gpu_id=gpu_id,
+            free_bytes=24 * 1024**3,
+            total_bytes=24 * 1024**3,
+        ),
+    )
+    training_config = RouterTrainingConfig.from_mapping(
+        {
+            "model": str(model_dir),
+            "tokenizer": str(tokenizer_path),
+            "data_source": "tests/fixtures/benchmarks/router_training_real.jsonl",
+            "split": "train",
+            "teacher_model": str(model_dir),
+            "student_model": str(model_dir),
+            "student_quantized_path": str(artifact_dir),
+            "distillation_loss": "router_cost_cross_entropy",
+            "precision_candidates": [4, 8],
+            "max_bit_width": 8,
+            "block_granularity": "mha_ffn",
+            "device": "cuda",
+            "gpu_ids": [0],
+            "seed": 0,
+            "output_dir": str(tmp_path / "router-train"),
+            "overwrite": True,
+            "prompt_format": "question_answer_v1",
+            "training_data_limit": 1,
+            "diagnostic": False,
+            "logging": {"console": False},
+        }
+    )
+
+    validate_router_training_preflight(training_config)
 
 
 def test_router_training_preflight_rejects_missing_method_before_run(

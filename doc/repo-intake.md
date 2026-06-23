@@ -208,8 +208,8 @@ No tests, evaluations, installs, or training commands were run during this intak
 - Full paper-scale reproduction is not done. Current accepted local router training uses small dependency-free fixtures, not LLaMA/Qwen benchmark-scale evidence.
 - `router_cost_cross_entropy` is a documented implementation assumption because the official QAQ router loss, calibration corpus, and hyperparameters are not specified in the available paper/code.
 - The current router objective estimates quantized-student behavior using bit-plane reconstruction distortion rather than executing a full quantized transformer block.
-- Full LLaMA 3.1 8B router training is blocked locally by the visible 6 GiB RTX 4050. The documented preflight expects at least 30.42 GiB free before activations for the current separate teacher/student BF16 loading path.
-- `configs/router_train_llama31_8b_sampled.yaml` is not expected to pass on the local RTX 4050; it needs the lab RTX 3090 setup or a changed shared/sequential teacher-student execution path.
+- Full LLaMA 3.1 8B router training is blocked locally by the visible 6 GiB RTX 4050. The same-model teacher/student path now shares the frozen reference adapter, and the documented preflight expects at least 15.46 GiB free before activations for the sampled base LLaMA config.
+- `configs/router_train_llama31_8b_sampled.yaml` is not expected to pass on the local RTX 4050; it needs the lab RTX 3090 setup or another memory reduction beyond shared same-model reference loading.
 - `configs/router_eval_real.json` is not standalone on a clean checkout until `python -m qaq.router.train --config configs/router_train_real.yaml` has produced the checkpoint under `runs/router_train_real`.
 - `configs/llama31_8b_first_milestone.*` require external LLaMA access, CUDA, artifacts, and router checkpoints; they are not self-contained smoke configs.
 - CUDA on-demand materialization exists, but GPU memory and transfer claims still need a full QAQ runtime path that applies materialized tensors to the model on the intended hardware.
@@ -246,7 +246,7 @@ No tests, evaluations, installs, or training commands were run during this intak
 - What exact dependency management approach should be used: requirements file, uv, Poetry, Conda, Docker, or documented manual install?
 - Should optional dependencies become declared extras, for example `qaq[dev]`, `qaq[hf]`, and `qaq[cuda]`?
 - What are the exact lab-server paths, CUDA versions, driver versions, and model-cache locations for the RTX 3090 environment?
-- Should LLaMA router training be changed to shared/sequential teacher-student execution so it can fit a single 24 GiB RTX 3090?
+- After shared same-model reference loading, what activation/warm-up margin is needed for the LLaMA router-training command on a single 24 GiB RTX 3090?
 - What is the accepted official or closest-defensible QAQ router objective if more paper details become available?
 - Which real calibration corpus and split should replace the small local router-training fixture for first-milestone evidence?
 - Which command should be the canonical first-milestone LLaMA evaluation once artifacts and checkpoint paths are available?
