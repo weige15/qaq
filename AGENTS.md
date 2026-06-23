@@ -131,3 +131,51 @@ Never claim complete while residual risk says:
 - no approved real objective
 - no real training data
 - no paper-scale or real-subset evidence
+
+## ML Runtime Policy
+
+This project uses a remote GPU server as the real ML runtime.
+
+Local machine:
+- GPU: RTX 4050
+- Purpose: code editing, static checks, small CPU tests, syntax checks only
+- Never treat local ML results as valid experiment results
+
+Remote target:
+- Use the lab server with RTX 3090 GPUs for all real ML workloads
+- Run training, full inference, evaluation, benchmark, and model-loading experiments only on the remote server
+
+Forbidden local commands:
+- `python train.py`
+- `python inference.py` when it loads a large language model
+- `torchrun`
+- `accelerate launch`
+- any script that loads HuggingFace LLM weights larger than 1GB
+- any full dataset evaluation
+- any GPU memory benchmark
+- any performance benchmark
+
+Allowed local commands:
+- `rg`, `ls`, `cat`, `sed`, `git status`, `git diff`
+- formatting and linting
+- unit tests that do not load large models
+- syntax checks
+- tiny smoke tests only if explicitly labeled as smoke tests
+
+Before running any ML command:
+1. Check whether the current host is the remote server.
+2. Run `hostname`.
+3. Run `nvidia-smi`.
+4. Confirm the visible GPU is not the local RTX 4050.
+5. If not on the remote server, do not run the command. Instead, print the exact SSH command the user should run.
+
+Experiment reports must include:
+- hostname
+- GPU name
+- CUDA_VISIBLE_DEVICES
+- command
+- git commit
+- Python environment
+- dataset path
+- output path
+- metric / score
