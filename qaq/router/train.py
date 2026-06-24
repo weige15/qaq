@@ -146,6 +146,8 @@ class RouterTrainingConfig:
     logging: LoggingConfig = LoggingConfig()
     router: RouterHyperparameters = RouterHyperparameters()
     diagnostic: bool = True
+    hf_device_map: str | None = None
+    hf_max_memory_per_gpu: str | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RouterTrainingConfig":
@@ -236,6 +238,11 @@ class RouterTrainingConfig:
             logging=logging,
             router=router,
             diagnostic=diagnostic,
+            hf_device_map=_optional_hf_device_map(data.get("hf_device_map")),
+            hf_max_memory_per_gpu=_optional_non_empty_string(
+                data.get("hf_max_memory_per_gpu"),
+                "hf_max_memory_per_gpu",
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -267,6 +274,8 @@ class RouterTrainingConfig:
             "logging": self.logging.as_dict(),
             "router": self.router.as_dict(),
             "diagnostic": self.diagnostic,
+            "hf_device_map": self.hf_device_map,
+            "hf_max_memory_per_gpu": self.hf_max_memory_per_gpu,
         }
 
     @property
@@ -300,6 +309,8 @@ class RouterTrainingConfig:
                 "device": self.device,
                 "prompt_format": self.prompt_format,
                 "metric": "router_distillation_loss",
+                "hf_device_map": self.hf_device_map,
+                "hf_max_memory_per_gpu": self.hf_max_memory_per_gpu,
             },
             validate_output=validate_output,
         )
@@ -373,6 +384,90 @@ def load_router_training_config(path: str | Path) -> RouterTrainingConfig:
     return RouterTrainingConfig.from_mapping(raw)
 
 
+PROHIBITED_NON_DIAGNOSTIC_MARKERS = (
+    "fake_smoke",
+    "smoke",
+    "fixture",
+    "fixtures",
+    "sampled",
+    "truncated",
+    "health",
+)
+
+
+def _validate_non_diagnostic_training_inputs(config: RouterTrainingConfig) -> None:
+    values = {
+        "model": config.model,
+        "tokenizer": config.tokenizer,
+        "data_source": config.data_source or "",
+        "teacher_model": config.teacher_model,
+        "student_model": config.student_model,
+        "student_quantized_path": (
+            str(config.student_quantized_path) if config.student_quantized_path else ""
+        ),
+    }
+    for field, value in values.items():
+        lowered = value.lower()
+        if any(marker in lowered for marker in PROHIBITED_NON_DIAGNOSTIC_MARKERS):
+            raise RouterTrainingError(
+                "prohibited_non_diagnostic_training_input",
+                f"non-diagnostic router training cannot use {field}={value!r}",
+            )
+
+
+def _validate_non_diagnostic_artifact_manifest(config: RouterTrainingConfig) -> None:
+    artifact_path = config.student_quantized_path
+    if artifact_path is None:
+        return
+    manifest_path: Path | None = None
+    if artifact_path.name == "runtime_artifact_index.json":
+        manifest_path = artifact_path.with_name("generation_manifest.json")
+    elif artifact_path.name == "artifact_index.json" and artifact_path.with_name("manifest.json").is_file():
+        manifest_path = artifact_path.with_name("manifest.json")
+    elif artifact_path.is_dir() and (artifact_path / "generation_manifest.json").is_file():
+        manifest_path = artifact_path / "generation_manifest.json"
+    elif artifact_path.is_dir() and (artifact_path / "manifest.json").is_file():
+        manifest_path = artifact_path / "manifest.json"
+    if manifest_path is None:
+        return
+    if not manifest_path.is_file():
+        raise RouterTrainingError(
+            "missing_artifact_generation_manifest",
+            f"{artifact_path} requires sibling generation_manifest.json for non-diagnostic training",
+        )
+    try:
+        raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RouterTrainingError("artifact_generation_manifest_invalid", str(exc)) from exc
+    if not isinstance(raw, Mapping):
+        raise RouterTrainingError(
+            "artifact_generation_manifest_invalid",
+            "generation manifest must be an object",
+        )
+    required = {
+        "accepted_as_full_quantized_inference_artifact": True,
+        "full_tensor_runtime_coverage": True,
+        "runtime_index_artifact_ref_mode": "full_tensor_index",
+        "sampled_or_truncated_probe": False,
+        "artifact_format": "safetensors",
+        "max_elements_per_tensor": None,
+        "tensor_limit_per_block": None,
+    }
+    mismatches = {
+        key: raw.get(key)
+        for key, expected in required.items()
+        if raw.get(key) != expected
+    }
+    if raw.get("model") != config.student_model:
+        mismatches["model"] = raw.get("model")
+    if mismatches:
+        raise RouterTrainingError(
+            "non_diagnostic_requires_full_tensor_artifacts",
+            "student_quantized_path must reference accepted full tensor-native runtime artifacts; "
+            f"mismatches={mismatches}",
+        )
+
+
 def _load_reference_adapters(config: RouterTrainingConfig) -> ReferenceAdapters:
     teacher = load_model_adapter(
         config.to_run_config(model=config.teacher_model, validate_output=False)
@@ -415,11 +510,13 @@ def validate_router_training_preflight(config: RouterTrainingConfig) -> None:
             "unsupported_distillation_loss",
             f"supported distillation losses are {sorted(SUPPORTED_DISTILLATION_LOSSES)}",
         )
-    if not config.diagnostic and not Path(config.data_source).is_file():
-        raise RouterTrainingError(
-            "non_diagnostic_training_requires_file_data",
-            "accepted router training requires a file-backed data_source",
-        )
+    if not config.diagnostic:
+        _validate_non_diagnostic_training_inputs(config)
+        if not Path(config.data_source).is_file():
+            raise RouterTrainingError(
+                "non_diagnostic_training_requires_file_data",
+                "accepted router training requires a file-backed data_source",
+            )
     if config.student_quantized_path is None:
         raise RouterTrainingError(
             "missing_student_quantized_path",
@@ -430,6 +527,8 @@ def validate_router_training_preflight(config: RouterTrainingConfig) -> None:
             "student_quantized_path_unavailable",
             f"{config.student_quantized_path} does not exist",
         )
+    if not config.diagnostic:
+        _validate_non_diagnostic_artifact_manifest(config)
     if config.device not in {"cpu", "cuda"}:
         raise RouterTrainingError(
             "invalid_device",
@@ -771,6 +870,11 @@ def _run_router_training_started(
             monitor=monitor,
             step=config.router.max_steps,
         )
+    checkpoint_path = _save_final_checkpoint_alias(
+        checkpoint,
+        config=config,
+        manifest=manifest,
+    )
 
     completion_event = LogEvent(
         event_type=EventType.COMPLETION.value,
@@ -1487,6 +1591,8 @@ def _training_metadata(
         "latest_validation_metrics": dict(validation_metrics),
         "parameter_update_l2": parameter_update_l2,
         "diagnostic_training": config.diagnostic,
+        "hf_device_map": config.hf_device_map,
+        "hf_max_memory_per_gpu": config.hf_max_memory_per_gpu,
     }
 
 
@@ -1520,6 +1626,25 @@ def _save_checkpoint(
     )
     writer.record(event)
     monitor.handle(event)
+    return checkpoint_path
+
+
+def _save_final_checkpoint_alias(
+    checkpoint: RouterCheckpoint,
+    *,
+    config: RouterTrainingConfig,
+    manifest: RunManifest,
+) -> Path:
+    try:
+        checkpoint_path = save_router_checkpoint(
+            checkpoint,
+            config.resolved_checkpoint_dir / "router_final.json",
+        )
+    except OSError as exc:
+        raise RouterTrainingError("router_checkpoint_write_failed", str(exc)) from exc
+    manifest.artifact_paths["router_checkpoint"] = str(checkpoint_path)
+    manifest.artifact_paths["router_final_checkpoint"] = str(checkpoint_path)
+    manifest.write()
     return checkpoint_path
 
 
@@ -1622,6 +1747,16 @@ def _parse_scalar(value: str) -> Any:
         return float(value)
     except ValueError:
         return value
+
+
+def _optional_hf_device_map(value: Any) -> str | None:
+    parsed = _optional_non_empty_string(value, "hf_device_map")
+    if parsed not in {None, "single", "auto"}:
+        raise RouterTrainingError(
+            "invalid_router_training_config",
+            "hf_device_map must be null, 'single', or 'auto'",
+        )
+    return parsed
 
 
 def _optional_mapping(value: Any) -> Mapping[str, Any] | None:

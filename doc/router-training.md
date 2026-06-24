@@ -34,13 +34,35 @@ All training commands must be launched on the lab GPU server through the GPU
 selector so the run inspects free physical devices, records the selected IDs,
 and avoids assuming physical GPU 0 is available.
 
-The non-diagnostic local-fixture acceptance command is:
+The historical local fixture command in `configs/router_train_real.yaml` is now implementation-regression coverage only. Non-diagnostic router training rejects smoke, fixture, sampled, truncated, and health-check inputs before model loading. First-milestone LLaMA router training must use a real file-backed benchmark export and accepted full tensor-native artifacts.
+
+Export real HellaSwag train/validation rows into the file-backed router schema with:
 
 ```bash
-python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.router.train --config configs/router_train_real.yaml
+python -m qaq.data export-router-jsonl \
+  --dataset hellaswag \
+  --output runs/llama_first_milestone/router/hellaswag_router_train.jsonl \
+  --overwrite
 ```
 
-The checkpoint-loaded evaluation command is:
+The first-milestone LLaMA/HellaSwag router-training command is:
+
+```bash
+python scripts/gpu_run.py --count 2 --min-free-mb 22000 \
+  --status-file runs/gpu-selector/hellaswag-router-train-full.json \
+  -- python -m qaq.router.train \
+  --config configs/router_train_llama31_8b_full_hellaswag.yaml
+```
+
+Completed training writes step checkpoints and a final checkpoint alias at:
+
+```text
+runs/llama_first_milestone/router/checkpoints/router_final.json
+```
+
+That final alias is the path used by the first-milestone HellaSwag QAQ configs.
+
+The checkpoint-loaded evaluation command for the local regression fixture remains:
 
 ```bash
 python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.evaluate --config configs/router_eval_real.json --artifact-index configs/router_eval_real_artifacts.json --skip-output-dir-check --print-json
@@ -66,8 +88,9 @@ The base checkpoint target is `meta-llama/Llama-3.1-8B`, not the Instruct varian
 
 A full Llama 3.1 8B router-training command additionally requires:
 
-- a file-backed calibration/training split,
-- Llama-compatible bit-plane artifacts for every controlled block in `student_quantized_path`,
+- a file-backed calibration/training split from real HellaSwag rows, not a named dataset fallback, smoke set, or fixture path,
+- Llama-compatible full tensor-native bit-plane artifacts for every controlled block in `student_quantized_path`,
+- artifact generation metadata showing `accepted_as_full_quantized_inference_artifact: true`, `full_tensor_runtime_coverage: true`, `runtime_index_artifact_ref_mode: full_tensor_index`, `sampled_or_truncated_probe: false`, and `artifact_format: safetensors`,
 - enough GPU memory to run teacher/student reference forwards when `reference_forward` is invoked.
 
 If those artifacts or local Hugging Face files are absent, the run must fail clearly instead of falling back to fake/local metadata.

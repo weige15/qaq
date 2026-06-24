@@ -198,7 +198,7 @@ def test_router_training_controlled_failure_writes_incomplete_marker(
             "training_data_limit": 3,
             "validation_data_limit": 2,
             "checkpoint_interval_steps": 1,
-            "diagnostic": False,
+            "diagnostic": True,
             "router": {
                 "learning_rate": 0.05,
                 "max_steps": 2,
@@ -228,7 +228,7 @@ def test_router_training_controlled_failure_writes_incomplete_marker(
     assert exc.value.code == "controlled_training_failure"
     assert manifest_data["status"] == STATUS_FAILED
     assert manifest_data["config"]["mode"] == "fp16"
-    assert manifest_data["config"]["router_diagnostic"] is False
+    assert manifest_data["config"]["router_diagnostic"] is True
     assert Path(manifest_data["incomplete_marker"]).exists()
     assert events[-1]["event_type"] == EventType.ERROR.value
     assert events[-1]["error_code"] == "controlled_training_failure"

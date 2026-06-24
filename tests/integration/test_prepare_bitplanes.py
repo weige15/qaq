@@ -8,10 +8,10 @@ safetensors_torch = pytest.importorskip("safetensors.torch")
 
 from qaq.artifacts import load_bitplane_artifact
 from qaq.prepare_bitplanes import main, prepare_bitplane_artifacts
-from qaq.router.train import RouterTrainingConfig, validate_router_training_preflight
+from qaq.router.train import RouterTrainingConfig, RouterTrainingError, validate_router_training_preflight
 
 
-def test_prepare_bitplanes_from_local_llama_safetensors_is_router_compatible(
+def test_prepare_bitplanes_from_local_llama_safetensors_is_sampled_not_non_diagnostic_router_evidence(
     tmp_path: Path,
 ) -> None:
     model_dir, tokenizer_path = _write_local_llama_fixture(tmp_path)
@@ -52,11 +52,16 @@ def test_prepare_bitplanes_from_local_llama_safetensors_is_router_compatible(
     assert set(index["layer_000.mha"]) == {"4", "8"}
     assert Path(index["layer_000.mha"]["4"]).is_absolute()
 
+    data_path = tmp_path / "router_data.jsonl"
+    data_path.write_text(
+        json.dumps({"id": "train-0", "split": "train", "text": "Train prompt", "target": "target"}) + "\n",
+        encoding="utf-8",
+    )
     training_config = RouterTrainingConfig.from_mapping(
         {
             "model": str(model_dir),
             "tokenizer": str(tokenizer_path),
-            "data_source": "tests/fixtures/benchmarks/router_training_real.jsonl",
+            "data_source": str(data_path),
             "split": "train",
             "teacher_model": str(model_dir),
             "student_model": str(model_dir),
@@ -75,7 +80,9 @@ def test_prepare_bitplanes_from_local_llama_safetensors_is_router_compatible(
             "logging": {"console": False},
         }
     )
-    validate_router_training_preflight(training_config)
+    with pytest.raises(RouterTrainingError) as exc:
+        validate_router_training_preflight(training_config)
+    assert getattr(exc.value, "code", None) == "non_diagnostic_requires_full_tensor_artifacts"
 
 
 def test_prepare_bitplanes_cli_rejects_existing_output_without_overwrite(

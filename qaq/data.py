@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
+import sys
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 @dataclass(slots=True)
@@ -117,6 +119,70 @@ def load_benchmark_examples(
             f"dataset {dataset!r} split {split!r} produced no examples",
         )
     return examples
+
+
+def export_router_training_jsonl(
+    *,
+    dataset: str,
+    output_path: str | Path,
+    splits: tuple[str, ...] = ("train", "validation"),
+    limits: Mapping[str, int | None] | None = None,
+    overwrite: bool = False,
+) -> dict[str, Any]:
+    """Export real benchmark rows into the file-backed router-training schema."""
+
+    if dataset not in _REAL_BENCHMARK_DATASETS:
+        raise BenchmarkDataError(
+            "unsupported_router_export_dataset",
+            "router export requires a supported real benchmark dataset name",
+        )
+    if not splits:
+        raise BenchmarkDataError("invalid_export_splits", "at least one split is required")
+
+    output = Path(output_path)
+    if output.exists() and not overwrite:
+        raise BenchmarkDataError(
+            "unsafe_export_overwrite",
+            f"{output} already exists; pass overwrite=True to replace it",
+        )
+
+    limit_map = dict(limits or {})
+    rows: list[dict[str, Any]] = []
+    split_counts: dict[str, int] = {}
+    for split in splits:
+        examples = load_benchmark_examples(
+            dataset,
+            split=split,
+            limit=limit_map.get(split),
+        )
+        split_counts[split] = len(examples)
+        for example in examples:
+            if example.target is None:
+                raise BenchmarkDataError(
+                    "missing_router_export_target",
+                    f"{dataset} split {split} example {example.example_id} has no target",
+                )
+            rows.append(
+                {
+                    "id": example.example_id,
+                    "split": split,
+                    "text": example.text,
+                    "target": example.target,
+                    "metadata": dict(example.metadata),
+                }
+            )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+    return {
+        "dataset": dataset,
+        "output_path": str(output),
+        "row_count": len(rows),
+        "split_counts": split_counts,
+    }
 
 
 def _load_builtin_dataset(dataset: str, *, split: str) -> tuple[BenchmarkExample, ...]:
@@ -531,3 +597,57 @@ def _target_from_labeled_choices(
     if index is not None and 0 <= index < len(choices):
         return choices[index]
     return None
+
+def _optional_limit(value: str | None) -> int | None:
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("limit must be positive")
+    return parsed
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="QAQ benchmark data utilities.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    export_parser = subparsers.add_parser(
+        "export-router-jsonl",
+        help="Export a real benchmark into file-backed router-training JSONL.",
+    )
+    export_parser.add_argument("--dataset", required=True)
+    export_parser.add_argument("--output", required=True)
+    export_parser.add_argument("--train-split", default="train")
+    export_parser.add_argument("--validation-split", default="validation")
+    export_parser.add_argument("--train-limit")
+    export_parser.add_argument("--validation-limit")
+    export_parser.add_argument("--overwrite", action="store_true")
+
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "export-router-jsonl":
+            limits = {
+                args.train_split: _optional_limit(args.train_limit),
+                args.validation_split: _optional_limit(args.validation_limit),
+            }
+            result = export_router_training_jsonl(
+                dataset=args.dataset,
+                output_path=args.output,
+                splits=(args.train_split, args.validation_split),
+                limits=limits,
+                overwrite=args.overwrite,
+            )
+        else:
+            parser.error(f"unsupported command {args.command}")
+    except (BenchmarkDataError, argparse.ArgumentTypeError, ValueError) as exc:
+        code = getattr(exc, "code", "data_export_failed")
+        message = getattr(exc, "message", str(exc))
+        print(json.dumps({"status": "failed", "code": code, "message": message}), file=sys.stderr)
+        return 1
+
+    print(json.dumps({"status": "completed", **result}, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

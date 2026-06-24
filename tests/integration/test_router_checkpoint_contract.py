@@ -6,7 +6,8 @@ import pytest
 from qaq.artifacts import save_bitplane_artifact
 from qaq.bitplanes import create_bitplane_artifact_from_quantized_values
 from qaq.blocks import discover_mha_ffn_blocks
-from qaq.config import RunConfig
+from qaq.config import RunConfig, load_config_file
+from qaq.data import export_router_training_jsonl
 from qaq.evaluate import main as evaluate_main
 from qaq.model_adapter import load_model_adapter
 from qaq.router import train as router_train_module
@@ -79,16 +80,90 @@ def _checkpoint(block_ids: tuple[str, ...]) -> RouterCheckpoint:
     )
 
 
-def _training_mapping(tmp_path: Path) -> dict:
+def _write_training_resources(tmp_path: Path) -> dict[str, str]:
+    root = tmp_path / "real_router_inputs"
+    root.mkdir(parents=True, exist_ok=True)
+    model_path = root / "router_model.json"
+    tokenizer_path = root / "router_tokenizer.json"
+    data_path = root / "router_data.jsonl"
+    artifact_dir = root / "bitplanes"
+    artifact_index = root / "artifact_index.json"
+
+    model_path.write_text(
+        json.dumps(
+            {
+                "type": "fake_causal_lm",
+                "model_id": str(model_path),
+                "num_layers": 2,
+                "hidden_size": 4,
+                "vocab_size": 8,
+            }
+        ),
+        encoding="utf-8",
+    )
+    tokenizer_path.write_text(
+        json.dumps(
+            {
+                "type": "fake_tokenizer",
+                "tokenizer_id": str(tokenizer_path),
+                "model_max_length": 128,
+            }
+        ),
+        encoding="utf-8",
+    )
+    rows = [
+        {"id": f"router-train-{index}", "split": "train", "text": f"Train prompt {index}", "target": f"train-{index}"}
+        for index in range(3)
+    ] + [
+        {"id": f"router-validation-{index}", "split": "validation", "text": f"Validation prompt {index}", "target": f"validation-{index}"}
+        for index in range(2)
+    ]
+    data_path.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in rows),
+        encoding="utf-8",
+    )
+
+    artifact_refs: dict[str, dict[str, str]] = {}
+    for block_id, tensor_name in (
+        ("layer_000.mha", "layers.0.mha.q_proj.weight"),
+        ("layer_000.ffn", "layers.0.ffn.gate_proj.weight"),
+        ("layer_001.mha", "layers.1.mha.q_proj.weight"),
+        ("layer_001.ffn", "layers.1.ffn.gate_proj.weight"),
+    ):
+        artifact = create_bitplane_artifact_from_quantized_values(
+            [[0, 255], [16, 240]],
+            model_id=str(model_path),
+            block_id=block_id,
+            tensor_name=tensor_name,
+            max_bit_width=8,
+            checkpoint_ref="router-test",
+            compatibility={"block_granularity": "mha_ffn"},
+        )
+        artifact_path = artifact_dir / f"{block_id}.json"
+        save_bitplane_artifact(artifact, artifact_path)
+        artifact_refs[block_id] = {"4": str(artifact_path), "8": str(artifact_path)}
+    artifact_index.write_text(json.dumps(artifact_refs, indent=2, sort_keys=True), encoding="utf-8")
+
     return {
-        "model": "tests/fixtures/models/router_local_model.json",
-        "tokenizer": "tests/fixtures/tokenizers/router_local_tokenizer.json",
-        "data_source": "tests/fixtures/benchmarks/router_training_real.jsonl",
+        "model": str(model_path),
+        "tokenizer": str(tokenizer_path),
+        "data_source": str(data_path),
+        "artifact_dir": str(artifact_dir),
+        "artifact_index": str(artifact_index),
+    }
+
+
+def _training_mapping(tmp_path: Path) -> dict:
+    resources = _write_training_resources(tmp_path)
+    return {
+        "model": resources["model"],
+        "tokenizer": resources["tokenizer"],
+        "data_source": resources["data_source"],
         "split": "train",
         "validation_split": "validation",
-        "teacher_model": "tests/fixtures/models/router_local_model.json",
-        "student_model": "tests/fixtures/models/router_local_model.json",
-        "student_quantized_path": "tests/fixtures/bitplanes/router_training_real",
+        "teacher_model": resources["model"],
+        "student_model": resources["model"],
+        "student_quantized_path": resources["artifact_dir"],
         "distillation_loss": "router_cost_cross_entropy",
         "precision_candidates": [4, 8],
         "max_bit_width": 8,
@@ -292,7 +367,7 @@ def test_router_training_real_data_acceptance_writes_reloadable_checkpoint_and_e
             "--config",
             str(eval_config_path),
             "--artifact-index",
-            "configs/router_eval_real_artifacts.json",
+            str(tmp_path / "real_router_inputs" / "artifact_index.json"),
             "--skip-output-dir-check",
             "--print-json",
         ]
@@ -317,12 +392,13 @@ def test_router_training_accepts_tensor_native_student_artifacts(
     torch = pytest.importorskip("torch")
     pytest.importorskip("safetensors.torch")
 
-    model = "tests/fixtures/models/router_local_model.json"
+    data = _training_mapping(tmp_path)
+    model = data["model"]
     config = RunConfig.from_mapping(
         {
             "model": model,
-            "tokenizer": "tests/fixtures/tokenizers/router_local_tokenizer.json",
-            "dataset": "tests/fixtures/benchmarks/router_training_real.jsonl",
+            "tokenizer": data["tokenizer"],
+            "dataset": data["data_source"],
             "split": "train",
             "mode": "fp16",
             "precision_candidates": [4, 8],
@@ -358,7 +434,6 @@ def test_router_training_accepts_tensor_native_student_artifacts(
             native_dir / f"{block.block_id}.qaq.safetensors",
         )
 
-    data = _training_mapping(tmp_path)
     data["student_quantized_path"] = str(native_dir)
     data["output_dir"] = str(tmp_path / "router-native-train")
     data["training_data_limit"] = 1
@@ -417,6 +492,11 @@ def test_router_training_cuda_preflight_rejects_insufficient_llama_memory(
         json.dumps({"metadata": {"total_size": 16 * 1024**3}, "weight_map": {}}),
         encoding="utf-8",
     )
+    data_path = tmp_path / "router_data.jsonl"
+    data_path.write_text(
+        json.dumps({"id": "train-0", "split": "train", "text": "Train prompt", "target": "target"}) + "\n",
+        encoding="utf-8",
+    )
     artifact_index = tmp_path / "artifact_index.json"
     artifact_index.write_text("{}\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -432,7 +512,7 @@ def test_router_training_cuda_preflight_rejects_insufficient_llama_memory(
         {
             "model": str(model_dir),
             "tokenizer": str(tokenizer_path),
-            "data_source": "tests/fixtures/benchmarks/router_training_real.jsonl",
+            "data_source": str(data_path),
             "split": "train",
             "teacher_model": str(model_dir),
             "student_model": str(model_dir),
@@ -494,6 +574,11 @@ def test_router_training_cuda_preflight_counts_shared_llama_reference_once(
         json.dumps({"metadata": {"total_size": 16 * 1024**3}, "weight_map": {}}),
         encoding="utf-8",
     )
+    data_path = tmp_path / "router_data.jsonl"
+    data_path.write_text(
+        json.dumps({"id": "train-0", "split": "train", "text": "Train prompt", "target": "target"}) + "\n",
+        encoding="utf-8",
+    )
     artifact_dir = tmp_path / "artifacts"
     for block_id, tensor_name in (
         ("layer_000.mha", "model.layers.0.self_attn.q_proj.weight"),
@@ -522,7 +607,7 @@ def test_router_training_cuda_preflight_counts_shared_llama_reference_once(
         {
             "model": str(model_dir),
             "tokenizer": str(tokenizer_path),
-            "data_source": "tests/fixtures/benchmarks/router_training_real.jsonl",
+            "data_source": str(data_path),
             "split": "train",
             "teacher_model": str(model_dir),
             "student_model": str(model_dir),
@@ -558,6 +643,137 @@ def test_router_training_preflight_rejects_missing_method_before_run(
 
     assert exc.value.code == "missing_distillation_loss"
     assert not training_config.output_dir.exists()
+
+
+def test_export_router_training_jsonl_writes_real_hellaswag_schema(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark_root = tmp_path / "benchmarks"
+    hellaswag_dir = benchmark_root / "hellaswag"
+    hellaswag_dir.mkdir(parents=True)
+    train_row = {
+        "ind": 1,
+        "split": "train",
+        "ctx": "A person opens a box and",
+        "endings": ["takes out a tool.", "falls asleep.", "paints the sky.", "eats a shoe."],
+        "label": "0",
+    }
+    validation_row = {
+        "ind": 2,
+        "split": "validation",
+        "ctx": "A person turns on the stove and",
+        "endings": ["starts cooking.", "drives away.", "opens an umbrella.", "throws a ball."],
+        "label": "0",
+    }
+    (hellaswag_dir / "train.jsonl").write_text(json.dumps(train_row) + "\n", encoding="utf-8")
+    (hellaswag_dir / "validation.jsonl").write_text(
+        json.dumps(validation_row) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QAQ_BENCHMARK_DATA_ROOT", str(benchmark_root))
+    monkeypatch.setenv("QAQ_DISABLE_HF_DATASETS", "1")
+
+    output = tmp_path / "hellaswag_router_train.jsonl"
+    result = export_router_training_jsonl(
+        dataset="hellaswag",
+        output_path=output,
+        overwrite=True,
+    )
+    rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+
+    assert result["split_counts"] == {"train": 1, "validation": 1}
+    assert [row["split"] for row in rows] == ["train", "validation"]
+    assert all({"id", "split", "text", "target"} <= set(row) for row in rows)
+    assert rows[0]["target"] == "takes out a tool."
+    assert rows[0]["metadata"]["real_benchmark"] is True
+    assert rows[0]["metadata"]["benchmark_name"] == "hellaswag"
+
+
+def test_router_training_non_diagnostic_rejects_prohibited_inputs(tmp_path: Path) -> None:
+    base = _training_mapping(tmp_path)
+    cases = (
+        ("data_source", "fake_smoke"),
+        ("data_source", "tests/fixtures/benchmarks/router_training_real.jsonl"),
+        ("student_quantized_path", "runs/llama31_8b_bitplanes_sampled/artifact_index.json"),
+        ("model", "fake-qaq-smoke-model"),
+    )
+    for field, value in cases:
+        data = {**base, field: value}
+        if field == "model":
+            data["teacher_model"] = value
+            data["student_model"] = value
+        config = RouterTrainingConfig.from_mapping(data)
+        with pytest.raises(RouterTrainingError) as exc:
+            validate_router_training_preflight(config)
+        assert exc.value.code == "prohibited_non_diagnostic_training_input"
+
+
+def test_router_training_non_diagnostic_rejects_nonaccepted_runtime_index(
+    tmp_path: Path,
+) -> None:
+    data = _training_mapping(tmp_path)
+    artifact_dir = tmp_path / "full_tensor_probe"
+    artifact_dir.mkdir()
+    runtime_index = artifact_dir / "runtime_artifact_index.json"
+    runtime_index.write_text("{}\n", encoding="utf-8")
+    (artifact_dir / "generation_manifest.json").write_text(
+        json.dumps(
+            {
+                "model": data["student_model"],
+                "accepted_as_full_quantized_inference_artifact": False,
+                "full_tensor_runtime_coverage": False,
+                "runtime_index_artifact_ref_mode": "partial_tensor_index",
+                "sampled_or_truncated_probe": True,
+                "artifact_format": "safetensors",
+                "max_elements_per_tensor": 16,
+                "tensor_limit_per_block": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    data["student_quantized_path"] = str(runtime_index)
+    config = RouterTrainingConfig.from_mapping(data)
+
+    with pytest.raises(RouterTrainingError) as exc:
+        validate_router_training_preflight(config)
+
+    assert exc.value.code == "non_diagnostic_requires_full_tensor_artifacts"
+    assert "full tensor-native" in exc.value.message
+
+
+def test_llama31_full_hellaswag_router_config_matches_qaq_checkpoint_path() -> None:
+    training_config = load_router_training_config(
+        "configs/router_train_llama31_8b_full_hellaswag.yaml"
+    )
+
+    assert training_config.model == "meta-llama/Llama-3.1-8B"
+    assert training_config.tokenizer == "meta-llama/Llama-3.1-8B"
+    assert training_config.teacher_model == "meta-llama/Llama-3.1-8B"
+    assert training_config.student_model == "meta-llama/Llama-3.1-8B"
+    assert training_config.student_quantized_path == Path(
+        "runs/llama31_8b_full_tensor_bitplanes/runtime_artifact_index.json"
+    )
+    assert training_config.distillation_loss == "router_cost_cross_entropy"
+    assert training_config.precision_candidates == (4, 8)
+    assert training_config.max_bit_width == 8
+    assert training_config.block_granularity == "mha_ffn"
+    assert training_config.device == "cuda"
+    assert training_config.diagnostic is False
+    assert training_config.hf_device_map == "auto"
+    assert training_config.resolved_checkpoint_dir / "router_final.json" == Path(
+        "runs/llama_first_milestone/router/checkpoints/router_final.json"
+    )
+
+    for mode in ("qaq_on_demand_off", "qaq_on_demand_on"):
+        run_config = load_config_file(
+            f"configs/benchmarks/llama_first_milestone/hellaswag/{mode}.json",
+            validate_output=False,
+        )
+        assert run_config.router_checkpoint == training_config.resolved_checkpoint_dir / "router_final.json"
+        assert run_config.precision_candidates == training_config.precision_candidates
+        assert run_config.max_bit_width == training_config.max_bit_width
+        assert run_config.block_granularity == training_config.block_granularity
 
 
 def test_router_training_real_yaml_config_loads() -> None:
