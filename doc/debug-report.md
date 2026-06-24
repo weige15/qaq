@@ -1,48 +1,41 @@
 # Debug Report
 
 ## Symptom
-`qaq.prepare_bitplanes` now finds a local Hugging Face snapshot for `meta-llama/Llama-3.1-8B`, but fails while loading model metadata because the snapshot does not contain `config.json`.
+The GPU-wrapped HellaSwag FP16 LLaMA evaluation selected an RTX 3090 successfully, then exited immediately with `Invalid device argument` before producing the requested result artifact.
 
 ## Reproduction Command
 Working directory: `/nfs/home/s314511048/qaq`
 Shell: `bash`
-Runtime: `Python 3.12.3`
-Environment: `/nfs/home/s314511048/.venv/bin/python`
+Runtime: `Python 3.12.3` from `/nfs/home/s314511048/.venv/bin/python`
+Environment: active `.venv`; host `basic-2`
 Relevant environment variables:
 ```text
-HF_HOME=/nfs/home/s314511048/.cache/huggingface
-HF_HUB_CACHE=/nfs/home/s314511048/.cache/huggingface/hub
-TRANSFORMERS_CACHE=<unset>
-HF_HUB_OFFLINE=<unset>
-TRANSFORMERS_OFFLINE=<unset>
+Parent process CUDA_VISIBLE_DEVICES=None
+Parent process QAQ_SELECTED_PHYSICAL_GPUS=None
+Child process CUDA_VISIBLE_DEVICES=1
+Child process QAQ_SELECTED_PHYSICAL_GPUS=1
 ```
 
 ```bash
-python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.prepare_bitplanes \
---model meta-llama/Llama-3.1-8B --output-dir runs/llama31_8b_bitplanes_sampled --sample-values 16 --overwrite --print-json
-```
-
-The full artifact-preparation command was not rerun during diagnosis. The metadata-only failure was reproduced with:
-
-```bash
-python -c "from transformers import AutoConfig; p='/nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b'; print(AutoConfig.from_pretrained(p, local_files_only=True))"
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 --status-file runs/gpu-selector/hellaswag-fp16-debug-subset.json -- python -m qaq.evaluate --config configs/benchmarks/llama_first_milestone/hellaswag/fp16.json --skip-output-dir-check --max-examples 128 --eval-batch-size 1 --hf-device-map single --result-output runs/llama_first_milestone/hellaswag/fp16_debug_subset/result_artifact.json --print-result-json
 ```
 
 ## Expected Behavior
-Transformers should read `config.json`, detect `model_type: llama`, and allow QAQ to discover the Llama block metadata before reading sampled safetensor weights.
+The selector should choose a free physical RTX 3090, expose it to the child as logical `cuda:0`, load the local LLaMA checkpoint, run the 128-example HellaSwag subset, and write a result artifact.
 
 ## Actual Behavior
-The snapshot contains model shards, tokenizer files, and `model.safetensors.index.json`, but no `config.json`, so Transformers cannot identify the model architecture.
+The selector chose physical GPU 1 and mapped it to child `cuda:0`, but the evaluator failed before model loading with `Invalid device argument`.
 
 ## Error Log
 ```text
-model_metadata_unavailable: model_unavailable: model '/nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b' is not a supported fake model or local Hugging Face config: Unrecognized model in /nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b. Should have a `model_type` key in its config.json.
-```
-
-Metadata-only reproduction:
-
-```text
-ValueError: Unrecognized model in /nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b. Should have a `model_type` key in its config.json.
+Traceback from direct runtime reproduction:
+  File "/nfs/home/s314511048/qaq/qaq/runtime/static.py", line 55, in run_static_runtime
+    _reset_cuda_peak_memory_if_available(config)
+  File "/nfs/home/s314511048/qaq/qaq/runtime/static.py", line 394, in _reset_cuda_peak_memory_if_available
+    torch.cuda.reset_peak_memory_stats(index)
+  File "/nfs/home/s314511048/.venv/lib/python3.12/site-packages/torch/cuda/memory.py", line 322, in reset_peak_memory_stats
+    return torch._C._cuda_resetPeakMemoryStats(device)
+RuntimeError: Invalid device argument
 ```
 
 ## Failure Layer Classification
@@ -51,56 +44,69 @@ Most likely layer:
 * Command problem: no
 * Permission problem: no
 * Shell/script invocation problem: no
-* Environment problem: yes
+* Environment problem: no
 * Dependency problem: no
 * Python/package/import problem: no
-* GPU/CUDA problem: no
+* GPU/CUDA problem: yes
 * Distributed/torchrun problem: no
 * Filesystem/path problem: no
-* Data/checkpoint/model file problem: yes
-* Code logic problem: no
-* Configuration problem: yes
+* Data/checkpoint/model file problem: no
+* Code logic problem: yes
+* Configuration problem: no
 * Resource problem: no
 * Concurrency/race problem: no
 * Unknown/insufficient evidence: no
 
-Final classification: incomplete local Hugging Face snapshot; required model metadata file is missing.
+Final classification: CUDA memory-stat handling in the runtime code. The selected GPU and logical CUDA mapping were valid.
 
 ## Hypotheses
 
-### Hypothesis 1: The downloaded snapshot is incomplete
-Why it could explain the symptom: `qaq.model_adapter._load_hf_config` first looks for `config.json` in the resolved local snapshot, then falls back to `AutoConfig.from_pretrained(..., local_files_only=True)`. Without `config.json`, Transformers cannot infer the Llama architecture.
-Evidence for: `config.json` does not exist in `/nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b`. The snapshot contains safetensor shards, tokenizer files, and `model.safetensors.index.json`.
-Evidence against: none found.
-How to verify: download `config.json` into the same Hugging Face cache entry and rerun the metadata-only `AutoConfig.from_pretrained(..., local_files_only=True)` probe.
+### Hypothesis 1: Wrong physical GPU ID was passed into PyTorch
+Why it could explain the symptom: `gpu_run.py` selected physical GPU 1, while PyTorch inside the child only sees it as logical `cuda:0`.
+Evidence for: physical/logical remapping is active: `CUDA_VISIBLE_DEVICES=1`, `pytorch_logical_mapping={"cuda:0": 1}`.
+Evidence against: the config uses `gpu_ids: [0]`, and a selector probe successfully allocated a tensor on child `cuda:0`.
+How to verify: run a GPU selector probe that allocates `torch.empty(..., device="cuda:0")`. This passed.
 
-### Hypothesis 2: The earlier download command selected weights but missed metadata
-Why it could explain the symptom: The model shards and tokenizer files are present, but `config.json` is not. A pattern-based or interrupted download can leave a cache snapshot that is usable for weight files but not for model metadata.
-Evidence for: `hf download meta-llama/Llama-3.1-8B config.json --dry-run --json` reports that `config.json` exists on the Hub and is 826 bytes.
-Evidence against: the exact prior download command output is not available in this diagnosis.
-How to verify: run the explicit filename download command for `config.json`, then check that the snapshot contains a `config.json` symlink.
+### Hypothesis 2: PyTorch rejects startup peak-memory reset before allocator state exists
+Why it could explain the symptom: the direct traceback points to `torch.cuda.reset_peak_memory_stats(0)` before LLaMA loading or inference.
+Evidence for: bypassing `qaq.evaluate` showed the exact failing call; a one-example run passed after making the reset path tolerant of this exception.
+Evidence against: none after traceback capture.
+How to verify: run the same runtime path with one real HellaSwag example under `gpu_run`. This passed after the fix.
 
 ## Most Likely Root Cause
-The base model cache is now present, but it is missing the required `config.json` metadata file. The repo did move past the previous "no local snapshot" failure. The new error is caused by a partial Hugging Face cache entry: QAQ/Transformers can see the snapshot directory, but cannot determine that it is a Llama model because the architecture config file is absent.
+`qaq.runtime.static` and `qaq.runtime.adaptive` treated CUDA peak-memory reset as mandatory. On this PyTorch/CUDA/server combination, `torch.cuda.reset_peak_memory_stats(0)` can raise built-in `RuntimeError: Invalid device argument` even when the selected logical CUDA device is valid and usable. The modules also import the project `RuntimeError` class, so a first attempt to catch `RuntimeError` would have caught the wrong class unless it explicitly targeted `builtins.RuntimeError`.
 
 ## Minimal Fix
-Download the missing metadata file explicitly:
+Keep CUDA memory measurement, but make startup memory-stat reset and peak-stat reads tolerant only of PyTorch's `invalid device argument` memory-stat failure. Re-raise all other runtime errors so real CUDA/model failures remain visible.
 
-```bash
-hf download meta-llama/Llama-3.1-8B config.json
-```
+Applied changes:
 
-Do not redownload all safetensor shards unless later verification shows they are corrupt or incomplete.
+* `qaq/runtime/static.py`: added safe wrappers around `reset_peak_memory_stats` and `max_memory_allocated`.
+* `qaq/runtime/adaptive.py`: applied the same safe wrappers for adaptive CUDA paths.
+* `tests/unit/test_runtime_cuda_memory_stats.py`: added regression tests for the PyTorch exception and for re-raising unrelated errors.
 
 ## Verification
 ```bash
-ls -la /nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b/config.json
-python -c "from transformers import AutoConfig; p='/nfs/home/s314511048/.cache/huggingface/hub/models--meta-llama--Llama-3.1-8B/snapshots/d04e592bb4f6aa9cfee91e2e20afa771667e1d4b'; c=AutoConfig.from_pretrained(p, local_files_only=True); print(c.model_type, c.num_hidden_layers, c.hidden_size)"
-python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.prepare_bitplanes --model meta-llama/Llama-3.1-8B --output-dir runs/llama31_8b_bitplanes_sampled --sample-values 16 --overwrite --print-json
+python -m pytest -q tests/unit/test_runtime_cuda_memory_stats.py
+python -m py_compile qaq/runtime/static.py qaq/runtime/adaptive.py tests/unit/test_runtime_cuda_memory_stats.py
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 --status-file runs/gpu-selector/hellaswag-fp16-trace-one-after-fix.json -- python -c "from dataclasses import replace; from qaq.config import load_config_file; from qaq.runtime.static import run_static_runtime; from qaq.results import build_result_artifact; c=load_config_file('configs/benchmarks/llama_first_milestone/hellaswag/fp16.json', validate_output=False); c=replace(c, max_examples=1, eval_batch_size=1, hf_device_map='single'); r=run_static_runtime(c); a=build_result_artifact(c,r); print(a.as_dict()['metrics']); print(r.metadata.get('model_device_map'), r.metadata.get('peak_gpu_memory_gb'))"
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 --status-file runs/gpu-selector/hellaswag-fp16-debug-subset.json -- python -m qaq.evaluate --config configs/benchmarks/llama_first_milestone/hellaswag/fp16.json --skip-output-dir-check --max-examples 128 --eval-batch-size 1 --hf-device-map single --result-output runs/llama_first_milestone/hellaswag/fp16_debug_subset/result_artifact.json --print-result-json
 ```
 
 Expected verification result:
 
 ```text
-config.json exists, the metadata probe prints llama 32 4096, and prepare_bitplanes proceeds past model metadata loading.
+Focused regression tests pass.
+Changed files compile.
+One-example LLaMA/HellaSwag runtime completes on physical GPU 1 mapped to cuda:0.
+The requested 128-example command completes and writes runs/llama_first_milestone/hellaswag/fp16_debug_subset/result_artifact.json.
+```
+
+Actual verification result:
+
+```text
+3 passed in 0.11s.
+py_compile passed.
+One-example GPU run completed, loaded LLaMA, used cuda:0, and recorded peak_gpu_memory_gb=15.002574920654297.
+The requested 128-example command completed, processed 128 / 10042 HellaSwag validation examples, wrote the result artifact, selected physical GPU 1, mapped cuda:0 -> physical 1, recorded peak_gpu_memory_gb=15.09602975845337, and rejected the artifact as accepted QAQ evidence for diagnostic_result and subset_debug_run.
 ```

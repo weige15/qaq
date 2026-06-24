@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 from collections.abc import Mapping
 from dataclasses import replace
@@ -391,7 +392,7 @@ def _reset_cuda_peak_memory_if_available(config: RunConfig) -> None:
     if torch is None or not torch.cuda.is_available():
         return
     for index in _cuda_memory_indices(torch, config):
-        torch.cuda.reset_peak_memory_stats(index)
+        _safe_reset_peak_memory_stats(torch, index)
 
 
 def _peak_gpu_memory_gb(config: RunConfig) -> float:
@@ -403,7 +404,7 @@ def _peak_gpu_memory_gb(config: RunConfig) -> float:
     indices = _cuda_memory_indices(torch, config)
     if not indices:
         return 0.0
-    peak_bytes = max(int(torch.cuda.max_memory_allocated(index)) for index in indices)
+    peak_bytes = max(_safe_max_memory_allocated(torch, index) for index in indices)
     return peak_bytes / float(1024**3)
 
 
@@ -429,6 +430,23 @@ def _try_import_torch() -> Any | None:
     except ImportError:
         return None
     return torch
+
+
+def _safe_reset_peak_memory_stats(torch: Any, index: int) -> None:
+    try:
+        torch.cuda.reset_peak_memory_stats(index)
+    except builtins.RuntimeError as exc:
+        if "invalid device argument" not in str(exc).lower():
+            raise
+
+
+def _safe_max_memory_allocated(torch: Any, index: int) -> int:
+    try:
+        return int(torch.cuda.max_memory_allocated(index))
+    except builtins.RuntimeError as exc:
+        if "invalid device argument" not in str(exc).lower():
+            raise
+        return 0
 
 
 def _static_runtime_impl(
