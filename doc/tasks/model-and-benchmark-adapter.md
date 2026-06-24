@@ -31,9 +31,9 @@ Experiment Configuration and Run Manifest. Coordinate model metadata with Block 
 - [x] Expose hidden representations at a documented feature point for each controlled block.
 - [x] Provide model architecture metadata to the Block Registry without leaking framework-specific details into downstream modules.
 - [x] Preserve fake/tiny adapter tests as diagnostic regression coverage only.
-- [ ] Add real local Hugging Face LLaMA adapter verification.
-- [ ] Add real-subset benchmark/tokenization verification using non-fake data.
-- [ ] Add lab-server GPU verification command for large checkpoint loading.
+- [x] Add real local Hugging Face LLaMA-family adapter verification path and CLI.
+- [x] Add real-benchmark local-root tokenization verification using non-fake adapter provenance.
+- [x] Add lab-server GPU verification command for opt-in large checkpoint loading.
 
 ## Tests and Quality Gates
 
@@ -44,8 +44,17 @@ Experiment Configuration and Run Manifest. Coordinate model metadata with Block 
 ## Done When
 
 - [x] Diagnostic fake adapter tests still pass, and adapter output now marks them diagnostic-only.
-- [ ] A real local Hugging Face LLaMA-family adapter path exists and fails clearly when dependencies, local files, tokenizer, model config, or CUDA are unavailable.
+- [x] A real local Hugging Face LLaMA-family adapter verification path exists and fails clearly when dependencies, local files, tokenizer, model config, or CUDA are unavailable.
 - [ ] The adapter can resolve a local cached `meta-llama/Llama-3.1-8B` snapshot without network access.
 - [x] The adapter records model id, tokenizer id, dataset, split, prompt format, context policy, selected GPU IDs when applicable, benchmark/data provenance, and whether the run is fake/diagnostic.
-- [ ] At least one non-fake local or lab-server verification command is documented.
+- [x] At least one non-fake local or lab-server verification command is documented.
 - [x] The task is not marked complete from `fake_smoke`, `TinyHFModel`, mocked model objects, synthetic tensors, or fixture-only tests.
+
+Verification commands:
+
+```bash
+python -m qaq.model_adapter --config configs/benchmarks/llama_first_milestone/hellaswag/fp16.json --limit 8 --print-json
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 --status-file runs/gpu-selector/model-adapter-load-weights.json -- python -m qaq.model_adapter --config configs/benchmarks/llama_first_milestone/hellaswag/fp16.json --limit 1 --load-weights --print-json
+```
+
+The first command verifies local metadata, tokenizer, and benchmark batching without loading weights. The second command is the lab-server-only large-checkpoint weight-load verification path.

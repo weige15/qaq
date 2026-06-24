@@ -12,6 +12,8 @@ from qaq.model_adapter import (
     HuggingFaceCausalLMAdapter,
     ModelAdapterError,
     load_model_adapter,
+    main as model_adapter_main,
+    verify_model_adapter_config,
 )
 from qaq.blocks import discover_mha_ffn_blocks
 
@@ -188,6 +190,122 @@ def test_named_real_benchmark_without_local_or_cached_data_fails_actionably(
     assert exc.value.code == "benchmark_dataset_unavailable"
     assert "QAQ_BENCHMARK_DATA_ROOT" in exc.value.message
     assert "hellaswag/validation.jsonl" in exc.value.message
+
+
+def test_real_llama_adapter_verification_uses_local_hf_tokenizer_and_real_benchmark_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    model_dir = tmp_path / "llama-local"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "llama",
+                "num_hidden_layers": 2,
+                "hidden_size": 6,
+                "vocab_size": 128,
+            }
+        ),
+        encoding="utf-8",
+    )
+    benchmark_root = tmp_path / "benchmarks"
+    hellaswag_dir = benchmark_root / "hellaswag"
+    hellaswag_dir.mkdir(parents=True)
+    (hellaswag_dir / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "ind": 7,
+                "split": "validation",
+                "ctx": "The chef sets a skillet on the stove and",
+                "endings": [
+                    "adds oil before cooking.",
+                    "writes a novel underwater.",
+                    "folds the moon in half.",
+                    "paints the soup blue.",
+                ],
+                "label": "0",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    class LocalHFTokenizer:
+        pad_token_id = 0
+        eos_token_id = 2
+        model_max_length = 64
+
+        @staticmethod
+        def encode(text: str, *, add_special_tokens: bool = True) -> list[int]:
+            prefix = [1] if add_special_tokens else []
+            return prefix + [3 + (ord(character) % 50) for character in text]
+
+    captured: dict[str, object] = {}
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(tokenizer_ref: str, *, local_files_only: bool) -> LocalHFTokenizer:
+            captured["tokenizer_ref"] = tokenizer_ref
+            captured["local_files_only"] = local_files_only
+            return LocalHFTokenizer()
+
+    class FakeTransformers:
+        AutoTokenizer = FakeAutoTokenizer
+
+    monkeypatch.setattr("qaq.model_adapter._import_transformers", lambda: FakeTransformers)
+    monkeypatch.setenv("QAQ_BENCHMARK_DATA_ROOT", str(benchmark_root))
+    monkeypatch.setenv("QAQ_DISABLE_HF_DATASETS", "1")
+
+    config_data = {
+        "model": str(model_dir),
+        "tokenizer": str(model_dir),
+        "dataset": "hellaswag",
+        "split": "validation",
+        "mode": "fp16",
+        "precision_candidates": [4, 8],
+        "max_bit_width": 8,
+        "block_granularity": "mha_ffn",
+        "device": "cpu",
+        "gpu_ids": [],
+        "seed": 0,
+        "output_dir": str(tmp_path / "run"),
+        "overwrite": False,
+        "logging": {"console": False},
+        "prompt_format": "lm_eval:hellaswag",
+        "metric": "target_nll",
+    }
+    config = RunConfig.from_mapping(config_data, validate_output=False)
+
+    result = verify_model_adapter_config(config, limit=1)
+
+    assert captured == {"tokenizer_ref": str(model_dir), "local_files_only": True}
+    assert result["status"] == "completed"
+    assert result["adapter_kind"] == "huggingface_llama"
+    assert result["model_source"] == "huggingface_local_metadata"
+    assert result["model_is_fake"] is False
+    assert result["tokenizer_is_fake"] is False
+    assert result["dataset_is_fake"] is False
+    assert result["fixture_only_data"] is False
+    assert result["benchmark_is_real"] is True
+    assert result["diagnostic"] is False
+    assert result["accepted_as_real_adapter_verification"] is True
+    assert result["weights_loaded"] is False
+    assert result["architecture"]["framework"] == "transformers_llama"
+    assert result["controlled_block_count"] == 4
+    assert result["batch_metadata"]["prompt_format"] == "lm_eval:hellaswag"
+    assert result["batch_metadata"]["context_length_policy"] == "truncate"
+    assert result["target_count"] == 1
+    assert result["dataset_sources"] == [str(hellaswag_dir / "validation.jsonl")]
+
+    config_path = tmp_path / "verify_config.json"
+    config_path.write_text(json.dumps(config_data), encoding="utf-8")
+
+    assert model_adapter_main(["--config", str(config_path), "--limit", "1", "--print-json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["accepted_as_real_adapter_verification"] is True
+    assert payload["weights_loaded"] is False
 
 
 def test_local_fake_model_and_tokenizer_metadata_can_be_loaded(tmp_path: Path) -> None:

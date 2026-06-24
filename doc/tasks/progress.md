@@ -14,6 +14,7 @@
   - Optional Hugging Face/LLaMA metadata and reference-forward support exists, but accepted evidence is not complete.
   - Do not treat this module as done until a real local LLaMA adapter verification and real-subset benchmark/tokenization verification are recorded.
   - Fake/tiny tests are diagnostic-only and cannot close this task.
+  - Real local Hugging Face/LLaMA-family metadata/tokenizer/benchmark verification is now implemented through `python -m qaq.model_adapter`; actual cached `meta-llama/Llama-3.1-8B` and lab GPU weight-load evidence remain unverified.
   - 2026-06-25T04:05:18+08:00: Added adapter-level provenance metadata to reference outputs: adapter kind, model source, fake model/tokenizer flags, fake dataset flag, fixture-only flag, real-benchmark flag, diagnostic flag, selected GPU IDs, dataset sources, and context-length policy. Tests now prove fake-smoke outputs remain diagnostic, local-root HellaSwag rows are recognized as real benchmark data while still diagnostic under a fake model, and injected TinyHF/mocked Hugging Face objects cannot satisfy real-adapter evidence. Verified with `python -m py_compile qaq/model_adapter.py tests/integration/test_model_adapter_smoke.py`, `python -m pytest -q tests/integration/test_model_adapter_smoke.py`, `python -m pytest -q tests/integration/test_static_equivalent_profiles.py`, and `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py`. Real local LLaMA snapshot verification and lab-server GPU loading remain incomplete.
 - [x] Block Registry and Precision Plan (`doc/tasks/block-registry-and-precision-plan.md`)
   - 2026-06-23T18:20:27+08:00: Implemented fake-transformer MHA/FFN block discovery, stable block descriptors, static/fixed/QAQ precision-plan validation, artifact availability checks, and block registry tests. Verified with `python -m pytest -q tests/unit/test_block_registry.py` and `python -m pytest -q`.
@@ -328,3 +329,14 @@
 - Evidence: `python -m pytest -q tests/integration/test_static_equivalent_profiles.py` passed with 9 tests.
 - Evidence: `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py` passed with 48 tests.
 - Remaining limitation: no real local `meta-llama/Llama-3.1-8B` snapshot verification, large checkpoint load, real GPU execution, or accepted benchmark artifact was run in this pass. Those remain lab-server tasks through `scripts/gpu_run.py`.
+
+### 2026-06-25T04:14:33+08:00
+
+- Continued the Model and Benchmark Adapter workstream only after the module still described itself around the fake smoke path.
+- Updated `qaq/model_adapter.py` docstring and added `verify_model_adapter_config` plus `python -m qaq.model_adapter --config ... --print-json`. The verifier loads the configured adapter and tokenizer, loads local benchmark rows, builds a tokenized batch, emits architecture/provenance metadata, and keeps large weight loading opt-in with `--load-weights`.
+- Added a lab-server-compatible large checkpoint verification command shape through `--load-weights`; this command must be launched through `scripts/gpu_run.py` for LLaMA-sized checkpoints.
+- Updated `tests/integration/test_model_adapter_smoke.py` with a non-fake local LLaMA-shaped Hugging Face config directory, a non-fake tokenizer wrapper, local HellaSwag rows under `QAQ_BENCHMARK_DATA_ROOT`, and the new CLI. The test verifies `accepted_as_real_adapter_verification: true` without loading weights.
+- Evidence: `python -m py_compile qaq/model_adapter.py tests/integration/test_model_adapter_smoke.py` passed.
+- Evidence: `python -m pytest -q tests/integration/test_model_adapter_smoke.py` passed with 10 tests.
+- Evidence: `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py` passed with 49 tests.
+- Remaining limitation: no actual cached `meta-llama/Llama-3.1-8B` snapshot verification, no lab RTX 3090 `--load-weights` execution, no full benchmark result artifact, and no accepted QAQ evidence was produced locally.

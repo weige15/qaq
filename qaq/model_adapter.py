@@ -1,8 +1,10 @@
-"""Model adapter contracts, fake smoke implementation, and optional HF Llama support."""
+"""Model adapter contracts and local Hugging Face/LLaMA verification support."""
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -10,8 +12,8 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from qaq.benchmark_adapter import TokenizedBenchmarkBatch, build_tokenized_batch
-from qaq.config import RunConfig
-from qaq.data import BenchmarkExample, load_benchmark_examples
+from qaq.config import RunConfig, load_config_file
+from qaq.data import BenchmarkDataError, BenchmarkExample, load_benchmark_examples
 
 
 @dataclass(slots=True)
@@ -688,6 +690,111 @@ def load_model_adapter(config: RunConfig) -> Any:
     )
 
 
+
+def verify_model_adapter_config(
+    config: RunConfig,
+    *,
+    limit: int | None = None,
+    max_length: int | None = None,
+    context_length_policy: str = "truncate",
+    load_weights: bool = False,
+) -> dict[str, Any]:
+    """Verify adapter metadata, tokenizer, and benchmark batching without fake fallback.
+
+    Weight loading is opt-in because LLaMA-sized checkpoints must be launched on
+    the lab GPU server through scripts/gpu_run.py under repository policy.
+    """
+
+    adapter = load_model_adapter(config)
+    examples = adapter.load_examples(config, limit=limit or config.max_examples)
+    batch = adapter.build_batch(
+        config,
+        examples,
+        max_length=max_length,
+        context_length_policy=context_length_policy,
+    )
+    adapter_kind = _adapter_kind(adapter)
+    if load_weights:
+        parameter_count = len(adapter.parameters())
+        weights_loaded = True
+        model_source = _loaded_model_source(adapter)
+    else:
+        parameter_count = None
+        weights_loaded = False
+        model_source = _metadata_model_source(adapter)
+    provenance = _adapter_provenance_metadata(
+        model_id=str(getattr(adapter, "model_id", config.model)),
+        tokenizer=adapter.tokenizer,
+        batch=batch,
+        adapter_kind=adapter_kind,
+        selected_gpu_ids=config.gpu_ids,
+        model_source=model_source,
+    )
+    architecture = adapter.architecture_metadata.as_dict()
+    result = {
+        "status": "completed",
+        "verification_type": "model_adapter",
+        "model": config.model,
+        "tokenizer": config.tokenizer,
+        "dataset": config.dataset,
+        "split": config.split,
+        "prompt_format": config.prompt_format or "plain",
+        "metric": config.metric,
+        "device": config.device,
+        "selected_gpu_ids": list(config.gpu_ids),
+        "hf_device_map": config.hf_device_map or "single",
+        "hf_max_memory_per_gpu": config.hf_max_memory_per_gpu,
+        "adapter_kind": adapter_kind,
+        "model_source": model_source,
+        "architecture": architecture,
+        "controlled_block_count": int(architecture.get("num_layers", 0)) * 2,
+        "batch_metadata": batch.metadata.as_dict(),
+        "example_count": len(examples),
+        "example_ids": list(batch.example_ids),
+        "target_count": sum(target is not None for target in batch.targets),
+        "weight_load_requested": load_weights,
+        "weights_loaded": weights_loaded,
+        "parameter_count": parameter_count,
+        **provenance,
+    }
+    result["accepted_as_real_adapter_verification"] = (
+        adapter_kind == "huggingface_llama"
+        and not result["diagnostic"]
+        and result["benchmark_is_real"]
+        and result["model_source"] in {
+            "huggingface_local_metadata",
+            "huggingface_local_pretrained",
+        }
+    )
+    return result
+
+
+def _adapter_kind(adapter: Any) -> str:
+    if isinstance(adapter, FakeCausalLMAdapter):
+        return "fake_adapter"
+    if isinstance(adapter, HuggingFaceCausalLMAdapter):
+        return "huggingface_llama"
+    return type(adapter).__name__
+
+
+def _metadata_model_source(adapter: Any) -> str:
+    if isinstance(adapter, FakeCausalLMAdapter):
+        return "fake_adapter"
+    if isinstance(adapter, HuggingFaceCausalLMAdapter):
+        return "huggingface_local_metadata"
+    return "unknown_adapter_metadata"
+
+
+def _loaded_model_source(adapter: Any) -> str:
+    if isinstance(adapter, FakeCausalLMAdapter):
+        return "fake_adapter"
+    if isinstance(adapter, HuggingFaceCausalLMAdapter):
+        if adapter._model_loaded_from_pretrained:
+            return "huggingface_local_pretrained"
+        return "injected_model_object"
+    return "unknown_adapter_loaded_model"
+
+
 def _load_fake_tokenizer(tokenizer_id: str) -> FakeTokenizer:
     if _is_fake_identifier(tokenizer_id):
         return FakeTokenizer(tokenizer_id)
@@ -1306,3 +1413,52 @@ def _layer_index_from_block_id(block_id: str) -> int:
             "invalid_block_id",
             f"cannot derive layer index from block_id {block_id!r}",
         ) from exc
+
+def _positive_int_arg(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be positive")
+    return parsed
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Verify QAQ model and benchmark adapter inputs.")
+    parser.add_argument("--config", required=True, help="Run config JSON/TOML to verify.")
+    parser.add_argument("--limit", type=_positive_int_arg, default=None)
+    parser.add_argument("--max-length", type=_positive_int_arg, default=None)
+    parser.add_argument(
+        "--context-length-policy",
+        choices=("truncate", "reject"),
+        default="truncate",
+    )
+    parser.add_argument(
+        "--load-weights",
+        action="store_true",
+        help="Also load model weights; use only on the lab GPU server for large checkpoints.",
+    )
+    parser.add_argument("--print-json", action="store_true", help="Print verification JSON.")
+    args = parser.parse_args(argv)
+    try:
+        config = load_config_file(args.config, validate_output=False)
+        result = verify_model_adapter_config(
+            config,
+            limit=args.limit,
+            max_length=args.max_length,
+            context_length_policy=args.context_length_policy,
+            load_weights=args.load_weights,
+        )
+    except (BenchmarkDataError, ModelAdapterError, ValueError) as exc:
+        code = getattr(exc, "code", "model_adapter_verification_failed")
+        message = getattr(exc, "message", str(exc))
+        print(
+            json.dumps({"status": "failed", "code": code, "message": message}, sort_keys=True),
+            file=sys.stderr,
+        )
+        return 1
+    if args.print_json:
+        print(json.dumps(result, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
