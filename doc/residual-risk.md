@@ -12,5 +12,10 @@ Router training now uses a minimal real implementation with `router_cost_cross_e
 - Llama 3.1 8B base metadata and local safetensor weights can be discovered through the Hugging Face adapter. `qaq.prepare_bitplanes` can prepare trainer-compatible sampled real-weight artifacts for all 64 controlled MHA/FFN blocks, and `qaq.llama_bitplanes --artifact-format safetensors` can write tensor-native `.qaq.safetensors` artifacts without JSON expansion. The verified native run includes a full 16,777,216-element Llama q-projection tensor, but not the complete model artifact set.
 - Full Llama router training still requires a GPU-backed reference forward run. For identical teacher/student model refs, the trainer now uses a shared frozen reference adapter and the preflight reports at least 15.46 GiB free before activations for the base Llama 3.1 8B sampled-artifact config. The current visible GPU is a 6 GiB RTX 4050, so the run still cannot complete locally. Distinct teacher/student model refs still require separate model loads unless another execution strategy is implemented.
 - CUDA on-demand materialization exists for selected JSON and tensor-native bit-plane tensors when torch can access CUDA. GPU memory and transfer claims still require a full QAQ runtime path that applies the materialized tensors to the model, plus the intended RTX 3090 hardware. The currently visible escalated device is a single 6 GiB RTX 4050, not the 8 RTX 3090 setup in `doc/requirements.md`.
+- Heavy training, inference, evaluation, benchmark, and large-model-loading
+  commands now require `scripts/gpu_run.py` on the lab server so free physical
+  RTX 3090 GPU IDs are selected and recorded before the child process sees them as
+  logical `cuda:0`, `cuda:1`, and so on. This prevents accidental local runs,
+  but it does not by itself provide paper-scale QAQ evidence.
 
 These are true research and scale limitations, not blockers for the local minimal router-training implementation.

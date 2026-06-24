@@ -15,10 +15,11 @@ or tensor-native safetensors artifacts:
 The generated indexes contain absolute artifact paths so they can be consumed
 from router-training configs without being resolved relative to the index file.
 
-Probe command for a small real-weight artifact sample:
+Probe command for a small real-weight artifact sample. Because this touches
+real LLaMA weight files, launch it through the lab-server GPU selector:
 
 ```bash
-python -m qaq.llama_bitplanes \
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.llama_bitplanes \
   --model meta-llama/Llama-3.1-8B \
   --artifact-format safetensors \
   --output-dir runs/llama31_8b_native_bitplanes_probe \
@@ -37,7 +38,7 @@ Full tensor-native artifact generation for a bounded tensor can be run without
 the JSON guard:
 
 ```bash
-python -m qaq.llama_bitplanes \
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.llama_bitplanes \
   --model meta-llama/Llama-3.1-8B \
   --artifact-format safetensors \
   --output-dir runs/llama31_8b_native_bitplanes_full_one_tensor \

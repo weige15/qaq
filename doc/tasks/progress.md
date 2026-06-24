@@ -210,3 +210,14 @@
 - Evidence: normal sandbox `python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml` failed with `cuda_unavailable`, then escalated GPU access reached the intended preflight and failed with `insufficient_cuda_memory`: the shared path needs 15.46 GiB free before activations, while cuda:0 reports 4.96 GiB free of 6.00 GiB total.
 - Evidence: full suite `python -m pytest -q` passed with `119 passed, 2 skipped`.
 - Remaining limitation: this is not a successful LLaMA router-training run; it only verifies the improved preflight and local real-data training path. The visible GPU is still too small for base LLaMA 3.1 8B reference execution.
+
+### 2026-06-24T10:33:57+08:00
+
+- Added the remote GPU command guard for heavy router training and related ML commands.
+- Added `scripts/gpu_run.py`, which queries `nvidia-smi`, selects eligible physical RTX 3090 GPU IDs from the lab server range, records the selected IDs and PyTorch logical mapping, sets `CUDA_VISIBLE_DEVICES` only for the child command, and fails before launching when no GPU satisfies `--count`, `--min-free-mb`, and the default `RTX 3090` name filter.
+- Added unit coverage with fake `nvidia-smi` output proving the wrapper selects the freest physical GPUs, rejects local/non-lab GPU names by default, exports the expected child-process environment, writes a status file, and does not run the child command when no suitable GPU is free.
+- Updated `AGENTS.md`, `doc/router-training.md`, and `doc/residual-risk.md` so heavy training, inference, evaluation, benchmark, and large-model-loading examples use `python scripts/gpu_run.py --count <N> --min-free-mb <MB> -- <command>` instead of assuming physical GPU 0 or direct local execution.
+- Evidence: `python -m py_compile scripts/gpu_run.py` passed.
+- Evidence: `python -m pytest -q tests/unit/test_gpu_run.py` passed with 4 tests.
+- Evidence: `python -m pytest -q tests/unit` passed with 70 tests.
+- Full training, inference, evaluation, benchmark, and large-model-loading commands were not run in this local cycle because they now require the lab-server GPU selector and suitable free RTX 3090 devices.

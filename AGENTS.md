@@ -70,8 +70,8 @@ python -m pytest -q tests/unit
 python -m pytest -q tests/integration
 python -m pytest -q tests/e2e
 python -m qaq.config configs/smoke.json --skip-output-dir-check --print-json
-python -m qaq.evaluate --config configs/smoke.json --skip-output-dir-check --print-json
-python -m qaq.router.train --health-check
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.evaluate --config configs/smoke.json --skip-output-dir-check --print-json
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.router.train --health-check
 ```
 
 `configs/router_train_smoke.yaml` is useful for config parsing coverage, but do
@@ -142,8 +142,26 @@ Local machine:
 - Never treat local ML results as valid experiment results
 
 Remote target:
-- Use the lab server with RTX 3090 GPUs for all real ML workloads
+- Use the lab server with physical GPU devices 0-7, each an RTX 3090, for all
+  real ML workloads
 - Run training, full inference, evaluation, benchmark, and model-loading experiments only on the remote server
+- Launch every training, inference, evaluation, benchmark, or large-model-loading
+  command through the GPU selector:
+
+```bash
+python scripts/gpu_run.py --count <N> --min-free-mb <MB> -- <command>
+```
+
+GPU selector rules:
+- Never hardcode `CUDA_VISIBLE_DEVICES=0`.
+- Never assume physical GPU 0 is free.
+- Inspect GPU status before running.
+- Record the selected physical GPU IDs.
+- By default, accept only devices whose `nvidia-smi` name contains `RTX 3090`;
+  do not override this unless intentionally targeting a different remote GPU.
+- Remember that PyTorch sees selected GPUs as `cuda:0`, `cuda:1`, and so on
+  inside the child process, even when the selected physical IDs are different.
+- If no suitable GPU is free, stop and report instead of running locally.
 
 Forbidden local commands:
 - `python train.py`
@@ -154,6 +172,8 @@ Forbidden local commands:
 - any full dataset evaluation
 - any GPU memory benchmark
 - any performance benchmark
+- direct `python -m qaq.router.train ...` for nontrivial training
+- direct `python -m qaq.evaluate ...` for full inference or evaluation
 
 Allowed local commands:
 - `rg`, `ls`, `cat`, `sed`, `git status`, `git diff`
@@ -165,14 +185,19 @@ Allowed local commands:
 Before running any ML command:
 1. Check whether the current host is the remote server.
 2. Run `hostname`.
-3. Run `nvidia-smi`.
-4. Confirm the visible GPU is not the local RTX 4050.
-5. If not on the remote server, do not run the command. Instead, print the exact SSH command the user should run.
+3. Use `python scripts/gpu_run.py --count <N> --min-free-mb <MB> -- <command>`
+   so `nvidia-smi` is queried and free physical GPU IDs are selected.
+4. Confirm the selected physical GPU IDs and the child-process
+   `CUDA_VISIBLE_DEVICES` mapping are recorded.
+5. If not on the remote server, or if no suitable GPU is free, do not run the
+   command locally. Report the exact command that should be run on the lab
+   server instead.
 
 Experiment reports must include:
 - hostname
 - GPU name
 - CUDA_VISIBLE_DEVICES
+- selected physical GPU IDs
 - command
 - git commit
 - Python environment

@@ -30,16 +30,20 @@ For Hugging Face Llama-family checkpoints, the adapter exposes MHA and FFN block
 
 ## Acceptance Command
 
-The non-diagnostic local acceptance command is:
+All training commands must be launched on the lab GPU server through the GPU
+selector so the run inspects free physical devices, records the selected IDs,
+and avoids assuming physical GPU 0 is available.
+
+The non-diagnostic local-fixture acceptance command is:
 
 ```bash
-python -m qaq.router.train --config configs/router_train_real.yaml
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.router.train --config configs/router_train_real.yaml
 ```
 
 The checkpoint-loaded evaluation command is:
 
 ```bash
-python -m qaq.evaluate --config configs/router_eval_real.json --artifact-index configs/router_eval_real_artifacts.json --skip-output-dir-check --print-json
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.evaluate --config configs/router_eval_real.json --artifact-index configs/router_eval_real_artifacts.json --skip-output-dir-check --print-json
 ```
 
 For non-diagnostic training, both the run manifest and router checkpoint metadata must record the run as non-diagnostic. The manifest uses an `fp16` reference run config because router training is not itself a QAQ inference pass and has no router checkpoint at manifest creation time.
@@ -51,7 +55,7 @@ When `overwrite: true` is set, the first log writer for a run truncates its prev
 Quick diagnostic health checks are separate:
 
 ```bash
-python -m qaq.router.train --health-check
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.router.train --health-check
 ```
 
 The health-check path may use built-in fake data and generated temporary artifacts. It is not an acceptance gate.
@@ -78,11 +82,12 @@ through a separately executed quantized transformer. Distinct teacher and
 student model references still use separate adapters and separate reference
 forwards.
 
-On the currently visible single RTX 4050 Laptop GPU, the reproducible Llama
-sampled-artifact training command is expected to fail before model loading:
+On the currently visible single RTX 4050 Laptop GPU, the Llama sampled-artifact
+training command must not be run directly. On the lab server, use the GPU
+selector and require enough free memory before model loading:
 
 ```bash
-python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 -- python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml
 ```
 
 Observed escalated preflight result after the shared-reference change on
@@ -101,7 +106,7 @@ run until it completes on a sufficiently large GPU setup.
 The minimal local artifact-preparation command for the base checkpoint is:
 
 ```bash
-python -m qaq.prepare_bitplanes --model meta-llama/Llama-3.1-8B --output-dir runs/llama31_8b_bitplanes_sampled --sample-values 16 --overwrite --print-json
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.prepare_bitplanes --model meta-llama/Llama-3.1-8B --output-dir runs/llama31_8b_bitplanes_sampled --sample-values 16 --overwrite --print-json
 ```
 
 This command reads the local Hugging Face safetensors snapshot, discovers the
@@ -126,7 +131,7 @@ source tensor shape, source dtype, sample policy, sample count, and
 For tensor-native artifacts, use the safetensors generator:
 
 ```bash
-python -m qaq.llama_bitplanes \
+python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.llama_bitplanes \
   --model meta-llama/Llama-3.1-8B \
   --artifact-format safetensors \
   --output-dir runs/llama31_8b_native_bitplanes_probe \
