@@ -110,6 +110,68 @@ def test_benchmark_fixture_tokenization_records_context_metadata(tmp_path: Path)
     assert length_exc.value.code == "invalid_max_length"
 
 
+def test_named_real_benchmark_resolves_from_local_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    benchmark_root = tmp_path / "benchmarks"
+    hellaswag_dir = benchmark_root / "hellaswag"
+    hellaswag_dir.mkdir(parents=True)
+    (hellaswag_dir / "validation.jsonl").write_text(
+        json.dumps(
+            {
+                "ind": 12,
+                "split": "validation",
+                "ctx": "A person opens the toolbox and",
+                "endings": [
+                    "finds a hammer.",
+                    "turns into a cloud.",
+                    "closes the ocean.",
+                    "eats the wrench.",
+                ],
+                "label": "0",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("QAQ_BENCHMARK_DATA_ROOT", str(benchmark_root))
+    monkeypatch.setenv("QAQ_DISABLE_HF_DATASETS", "1")
+    config = _config(
+        tmp_path,
+        dataset="hellaswag",
+        split="validation",
+        prompt_format="lm_eval:hellaswag",
+    )
+    adapter = load_model_adapter(config)
+
+    examples = load_benchmark_examples(config.dataset, split=config.split)
+    batch = build_tokenized_batch(config, examples, adapter.tokenizer)
+
+    assert len(examples) == 1
+    assert examples[0].example_id == "12"
+    assert examples[0].target == "finds a hammer."
+    assert examples[0].metadata["real_benchmark"] is True
+    assert examples[0].metadata["benchmark_name"] == "hellaswag"
+    assert "Choices:" in examples[0].text
+    assert batch.metadata.prompt_format == "lm_eval:hellaswag"
+
+
+def test_named_real_benchmark_without_local_or_cached_data_fails_actionably(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("QAQ_BENCHMARK_DATA_ROOT", str(tmp_path / "empty-benchmarks"))
+    monkeypatch.setenv("QAQ_DISABLE_HF_DATASETS", "1")
+
+    with pytest.raises(BenchmarkDataError) as exc:
+        load_benchmark_examples("hellaswag", split="validation")
+
+    assert exc.value.code == "benchmark_dataset_unavailable"
+    assert "QAQ_BENCHMARK_DATA_ROOT" in exc.value.message
+    assert "hellaswag/validation.jsonl" in exc.value.message
+
+
 def test_local_fake_model_and_tokenizer_metadata_can_be_loaded(tmp_path: Path) -> None:
     model_metadata = tmp_path / "model.json"
     tokenizer_metadata = tmp_path / "tokenizer.json"

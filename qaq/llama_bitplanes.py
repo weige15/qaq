@@ -95,6 +95,7 @@ def generate_llama_bitplane_artifacts(
     max_elements_per_tensor: int | None = DEFAULT_MAX_ELEMENTS,
     allow_full_tensor_json: bool = False,
     artifact_format: str = ARTIFACT_FORMAT_JSON,
+    require_full_runtime_coverage: bool = False,
     overwrite: bool = False,
 ) -> LlamaBitPlaneGenerationResult:
     """Create QAQ bit-plane artifacts from locally cached LLaMA safetensors.
@@ -151,6 +152,14 @@ def generate_llama_bitplane_artifacts(
             "no_blocks_selected",
             "at least one LLaMA block must be selected",
         )
+    if require_full_runtime_coverage and _diagnostic_limit_requested(
+        tensor_limit_per_block=tensor_limit_per_block,
+        max_elements_per_tensor=max_elements_per_tensor,
+    ):
+        raise LlamaBitPlaneGenerationError(
+            "incomplete_tensor_artifact_index",
+            "full runtime coverage requires tensor_limit_per_block=None and max_elements_per_tensor=None",
+        )
 
     weight_map = _load_safetensor_weight_map(snapshot)
     records: list[GeneratedArtifactRecord] = []
@@ -181,6 +190,10 @@ def generate_llama_bitplane_artifacts(
             "no selected block tensors produced artifacts",
         )
 
+    runtime_coverage = _runtime_index_coverage(tuple(selected_blocks), tuple(records))
+    if require_full_runtime_coverage and not runtime_coverage["full_tensor_runtime_coverage"]:
+        _raise_incomplete_tensor_artifact_index(runtime_coverage)
+
     tensor_index_path = _write_tensor_index(
         output_dir,
         records=tuple(records),
@@ -203,6 +216,7 @@ def generate_llama_bitplane_artifacts(
         max_elements_per_tensor=max_elements_per_tensor,
         allow_full_tensor_json=allow_full_tensor_json,
         artifact_format=artifact_format,
+        require_full_runtime_coverage=require_full_runtime_coverage,
         records=tuple(records),
         tensor_index_path=tensor_index_path,
         runtime_index_path=runtime_index_path,
@@ -669,6 +683,17 @@ def _runtime_index_coverage(
     }
 
 
+def _raise_incomplete_tensor_artifact_index(runtime_coverage: Mapping[str, Any]) -> None:
+    incomplete = runtime_coverage.get("runtime_index_incomplete_blocks")
+    raise LlamaBitPlaneGenerationError(
+        "incomplete_tensor_artifact_index",
+        (
+            "full runtime coverage requires every tensor in every selected controlled "
+            f"block to have a non-truncated artifact; incomplete_blocks={incomplete}"
+        ),
+    )
+
+
 def _write_generation_manifest(
     output_dir: Path,
     *,
@@ -683,15 +708,29 @@ def _write_generation_manifest(
     max_elements_per_tensor: int | None,
     allow_full_tensor_json: bool,
     artifact_format: str,
+    require_full_runtime_coverage: bool,
     records: tuple[GeneratedArtifactRecord, ...],
     tensor_index_path: Path,
     runtime_index_path: Path,
 ) -> Path:
     path = output_dir / "generation_manifest.json"
     runtime_coverage = _runtime_index_coverage(blocks, records)
+    truncated_artifact_count = sum(record.truncated for record in records)
+    diagnostic_generation_requested = _diagnostic_limit_requested(
+        tensor_limit_per_block=tensor_limit_per_block,
+        max_elements_per_tensor=max_elements_per_tensor,
+    )
+    sampled_or_truncated_probe = diagnostic_generation_requested or truncated_artifact_count > 0
     all_discovered_blocks_covered = (
         bool(runtime_coverage["full_tensor_runtime_coverage"])
         and block_count == discovered_block_count
+    )
+    accepted_as_full_quantized_inference_artifact = (
+        all_discovered_blocks_covered and not sampled_or_truncated_probe
+    )
+    full_tensor_native_runtime_artifacts = (
+        accepted_as_full_quantized_inference_artifact
+        and artifact_format == ARTIFACT_FORMAT_SAFETENSORS
     )
     payload = {
         "model": model,
@@ -704,18 +743,63 @@ def _write_generation_manifest(
         "max_elements_per_tensor": max_elements_per_tensor,
         "allow_full_tensor_json": allow_full_tensor_json,
         "artifact_format": artifact_format,
+        "require_full_runtime_coverage": require_full_runtime_coverage,
         "artifact_count": len(records),
-        "truncated_artifact_count": sum(record.truncated for record in records),
+        "truncated_artifact_count": truncated_artifact_count,
+        "diagnostic_generation_requested": diagnostic_generation_requested,
+        "sampled_or_truncated_probe": sampled_or_truncated_probe,
         "tensor_index_path": str(tensor_index_path),
         "runtime_index_path": str(runtime_index_path),
         "runtime_index_uses_first_tensor_per_block": False,
         "all_discovered_blocks_covered": all_discovered_blocks_covered,
-        "accepted_as_full_quantized_inference_artifact": all_discovered_blocks_covered,
+        "full_tensor_runtime_artifacts": accepted_as_full_quantized_inference_artifact,
+        "full_tensor_native_runtime_artifacts": full_tensor_native_runtime_artifacts,
+        "partial_tensor_index": (
+            runtime_coverage["runtime_index_artifact_ref_mode"] == "partial_tensor_index"
+        ),
+        "accepted_as_full_quantized_inference_artifact": (
+            accepted_as_full_quantized_inference_artifact
+        ),
+        "artifact_acceptance_status": _artifact_acceptance_status(
+            runtime_coverage=runtime_coverage,
+            sampled_or_truncated_probe=sampled_or_truncated_probe,
+            all_discovered_blocks_covered=all_discovered_blocks_covered,
+            full_tensor_native_runtime_artifacts=full_tensor_native_runtime_artifacts,
+        ),
         **runtime_coverage,
         "records": [record.as_dict() for record in records],
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
+
+
+def _diagnostic_limit_requested(
+    *,
+    tensor_limit_per_block: int | None,
+    max_elements_per_tensor: int | None,
+) -> bool:
+    return tensor_limit_per_block is not None or max_elements_per_tensor is not None
+
+
+def _artifact_acceptance_status(
+    *,
+    runtime_coverage: Mapping[str, Any],
+    sampled_or_truncated_probe: bool,
+    all_discovered_blocks_covered: bool,
+    full_tensor_native_runtime_artifacts: bool,
+) -> str:
+    mode = runtime_coverage["runtime_index_artifact_ref_mode"]
+    if mode == "partial_tensor_index":
+        return "partial_tensor_index"
+    if sampled_or_truncated_probe:
+        return "sampled_truncated_diagnostic_probe"
+    if full_tensor_native_runtime_artifacts:
+        return "full_tensor_native_accepted_inference_artifact"
+    if all_discovered_blocks_covered and mode == "full_tensor_index":
+        return "full_tensor_accepted_inference_artifact"
+    if mode == "full_tensor_index":
+        return "selected_block_subset_full_tensor_index"
+    return str(mode)
 
 
 def _safe_filename(value: str) -> str:
@@ -769,6 +853,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="Artifact storage format to generate.",
     )
     parser.add_argument("--allow-full-tensor-json", action="store_true")
+    parser.add_argument(
+        "--require-full-runtime-coverage",
+        action="store_true",
+        help="Fail unless every selected block tensor has a non-truncated artifact.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--print-json", action="store_true")
     args = parser.parse_args(argv)
@@ -785,6 +874,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_elements_per_tensor=args.max_elements_per_tensor,
             allow_full_tensor_json=args.allow_full_tensor_json,
             artifact_format=args.artifact_format,
+            require_full_runtime_coverage=args.require_full_runtime_coverage,
             overwrite=args.overwrite,
         )
     except LlamaBitPlaneGenerationError as exc:

@@ -6,6 +6,8 @@ Router training now uses a minimal real implementation with `router_cost_cross_e
 
 ## Remaining Research Limitations
 
+
+- A strict acceptance contract and first-milestone benchmark config stubs now exist, but real benchmark integration is still not accepted. The configs name real benchmarks and validate structurally only; they must not be described as benchmark support until QAQ evaluation produces real artifacts through the benchmark backend and the report accepts the full five-mode matrix.
 - The official QAQ router loss, calibration corpus, and hyperparameters remain unavailable in the PDF and official code is not available in this repo.
 - The current objective estimates quantized-student behavior from bit-plane reconstruction distortion rather than executing a full quantized transformer block.
 - Local router-training acceptance uses small dependency-free fixtures. It is implementation evidence, not a paper-scale LLaMA/Qwen reproduction.

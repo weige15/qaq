@@ -1,0 +1,29 @@
+{
+  "block_granularity": "mha_ffn",
+  "dataset": "wikitext2",
+  "device": "cuda",
+  "gpu_ids": [
+    0
+  ],
+  "logging": {
+    "checkpoint_interval_steps": 500,
+    "console": true,
+    "log_dir": "runs/llama_first_milestone/wikitext2/static_8bit/logs",
+    "progress_interval_steps": 10
+  },
+  "max_bit_width": 8,
+  "metric": "perplexity",
+  "mode": "static_8bit",
+  "model": "meta-llama/Llama-3.1-8B",
+  "notes": "First-milestone structural config for a real benchmark name. Not accepted until benchmark adapter, full tensor artifacts, GPU selector record, and all five mode result artifacts pass doc/acceptance-contract.md.",
+  "output_dir": "runs/llama_first_milestone/wikitext2/static_8bit",
+  "overwrite": false,
+  "precision_candidates": [
+    4,
+    8
+  ],
+  "prompt_format": "lm_eval:wikitext2",
+  "seed": 0,
+  "split": "test",
+  "use_model_tokenizer": true
+}

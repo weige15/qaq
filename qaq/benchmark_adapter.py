@@ -136,9 +136,11 @@ def build_tokenized_batch(
 
 
 def format_prompt(example: BenchmarkExample, *, prompt_format: str) -> str:
-    """Apply a small, explicit set of prompt formats for smoke tests."""
+    """Apply explicit prompt formats for smoke and benchmark adapter tests."""
 
     if prompt_format in {"plain", "fake_smoke_v1", "paper_aligned_default"}:
+        return example.text
+    if prompt_format.startswith("lm_eval:"):
         return example.text
     if prompt_format == "question_answer_v1":
         return f"Question: {example.text}\nAnswer:"

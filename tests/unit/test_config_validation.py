@@ -136,6 +136,27 @@ def test_config_cli_validates_config_stub() -> None:
     assert main(["configs/smoke.json", "--skip-output-dir-check"]) == 0
 
 
+def test_llama_first_milestone_benchmark_configs_validate_structurally() -> None:
+    config_paths = sorted(
+        Path("configs/benchmarks/llama_first_milestone").glob("*/*.json")
+    )
+
+    assert len(config_paths) == 30
+    for path in config_paths:
+        config = load_config_file(path, validate_output=False)
+        assert config.model == "meta-llama/Llama-3.1-8B"
+        assert config.dataset != "fake_smoke"
+        assert config.mode in {
+            "fp16",
+            "static_8bit",
+            "static_4bit",
+            "qaq_on_demand_off",
+            "qaq_on_demand_on",
+        }
+        assert config.device == "cuda"
+        assert config.use_model_tokenizer is True
+
+
 def test_config_cli_returns_validation_exit_code_for_invalid_config() -> None:
     assert (
         main(

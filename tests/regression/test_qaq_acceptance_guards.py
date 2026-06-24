@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 from pathlib import Path
 
@@ -14,7 +15,9 @@ from qaq.router.types import (
     RouterBlockParameters,
     RouterCheckpointMetadata,
 )
-from qaq.results import build_result_artifact, validate_comparison
+from qaq.report import build_report
+from qaq.results import build_result_artifact, save_result_artifact, validate_comparison
+from tests.unit.test_results_schema import _artifact as _metadata_result_artifact
 from qaq.runtime.adaptive import (
     run_adaptive_runtime,
     validate_adaptive_acceptance_metadata,
@@ -180,6 +183,9 @@ def test_on_demand_acceptance_guard_requires_loader_summary(
 def test_cuda_on_demand_runtime_never_silently_uses_cpu_loader(
     tmp_path: Path,
 ) -> None:
+    if "QAQ_GPU_RUN_STATUS" not in os.environ:
+        pytest.skip("CUDA runtime check must be launched through scripts/gpu_run.py")
+
     base = _config(tmp_path, "qaq_on_demand_on", router_diagnostic=True)
     refs = _refs(tmp_path, base)
     checkpoint = _checkpoint(tmp_path, base)
@@ -314,6 +320,76 @@ def test_result_reporter_marks_fake_cpu_matrix_diagnostic(tmp_path: Path) -> Non
     assert validation.state == "diagnostic"
     assert "diagnostic_or_constrained_results" in validation.reasons
 
+
+
+def test_fake_smoke_result_artifacts_are_never_accepted(tmp_path: Path) -> None:
+    artifacts = _reporter_matrix(tmp_path)
+    validation = validate_comparison(artifacts)
+
+    assert validation.state == "diagnostic"
+    assert all(artifact.accepted_as_qaq_result is False for artifact in artifacts)
+    assert all(artifact.evidence_level == "diagnostic_health_check" for artifact in artifacts)
+    assert any("fake_dataset" in artifact.rejection_reasons for artifact in artifacts)
+
+
+def test_router_health_check_result_artifacts_are_never_accepted() -> None:
+    artifact = _metadata_result_artifact(
+        "qaq_on_demand_off",
+        metadata={
+            "runtime_metadata": {
+                "artifact_ref_mode": "full_tensor_index",
+                "mixed_precision_forward_applied": True,
+                "router_health_check": True,
+            }
+        },
+    )
+
+    assert artifact.evidence_level == "diagnostic_health_check"
+    assert artifact.accepted_as_qaq_result is False
+    assert "smoke_fixture_or_synthetic_data" in artifact.rejection_reasons
+
+
+def test_partial_tensor_artifacts_are_never_accepted() -> None:
+    artifact = _metadata_result_artifact(
+        "static_8bit",
+        artifact_ref_mode="partial_tensor_index",
+        mixed_precision_forward_applied=True,
+    )
+
+    assert artifact.evidence_level == "real_path_implemented"
+    assert artifact.accepted_as_qaq_result is False
+    assert "unaccepted_artifact_ref_mode:partial_tensor_index" in artifact.rejection_reasons
+
+
+def test_report_rejects_mixed_fake_real_comparisons(tmp_path: Path) -> None:
+    artifacts = [
+        _metadata_result_artifact("fp16"),
+        _metadata_result_artifact("static_8bit"),
+        _metadata_result_artifact("static_4bit"),
+        _metadata_result_artifact("qaq_on_demand_off"),
+        _metadata_result_artifact(
+            "qaq_on_demand_on",
+            model="fake-qaq-smoke-model",
+            tokenizer="fake-qaq-smoke-tokenizer",
+            dataset="fake_smoke",
+            prompt_format="fake_smoke_v1",
+        ),
+    ]
+    paths = [
+        save_result_artifact(artifact, tmp_path / f"{index}-{artifact.mode}.json")
+        for index, artifact in enumerate(artifacts)
+    ]
+
+    report = build_report(paths)
+
+    states = [comparison["validation"]["state"] for comparison in report["comparisons"]]
+    reasons = [
+        reason
+        for comparison in report["comparisons"]
+        for reason in comparison["validation"]["reasons"]
+    ]
+    assert "accepted" not in states
+    assert any(reason.startswith("missing_required_modes:") for reason in reasons)
 
 def _reporter_matrix(tmp_path: Path):
     base = _config(tmp_path, "fp16", router_diagnostic=True)

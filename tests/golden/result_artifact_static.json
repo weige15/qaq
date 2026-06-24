@@ -1,14 +1,51 @@
 {
+  "accepted_as_qaq_result": true,
+  "artifact_ref_mode": "full_tensor_index",
+  "artifact_scope": "full_runtime_tensor_index",
+  "benchmark_name": "HellaSwag",
+  "benchmark_split": "validation",
   "block_granularity": "mha_ffn",
   "completion_status": "completed",
   "constrained": false,
   "dataset": "HellaSwag",
+  "dataset_is_fake": false,
   "diagnostic": false,
+  "evidence_level": "accepted_experiment_result",
   "gpu_ids": [
     0
   ],
+  "gpu_selector_record": {
+    "command": [
+      "python",
+      "-m",
+      "qaq.evaluate"
+    ],
+    "cuda_visible_devices": "0",
+    "pytorch_logical_mapping": {
+      "cuda:0": 0
+    },
+    "selected_physical_gpu_ids": [
+      0
+    ],
+    "status": "selected"
+  },
   "hardware": {
     "gpu_model": "NVIDIA GeForce RTX 3090",
+    "gpu_selector_record": {
+      "command": [
+        "python",
+        "-m",
+        "qaq.evaluate"
+      ],
+      "cuda_visible_devices": "0",
+      "pytorch_logical_mapping": {
+        "cuda:0": 0
+      },
+      "selected_physical_gpu_ids": [
+        0
+      ],
+      "status": "selected"
+    },
     "selected_gpu_ids": [
       0
     ]
@@ -20,7 +57,12 @@
     "eval_log": "runs/static_8bit/eval.jsonl"
   },
   "max_bit_width": 8,
-  "metadata": {},
+  "metadata": {
+    "runtime_metadata": {
+      "artifact_ref_mode": "full_tensor_index",
+      "mixed_precision_forward_applied": true
+    }
+  },
   "metric": "exact_match",
   "metrics": {
     "latency": {
@@ -41,11 +83,13 @@
       "perplexity": null,
       "primary_value": 0.75,
       "score": 0.75,
-      "source": "fixture"
+      "source": "schema_fixture_not_benchmark_claim"
     }
   },
+  "mixed_precision_forward_applied": true,
   "mode": "static_8bit",
   "model": "LLaMA-3.1-8B",
+  "model_is_fake": false,
   "notes": [],
   "peak_gpu_memory_gb": 10.5,
   "perplexity": null,
@@ -54,6 +98,7 @@
     8
   ],
   "prompt_format": "hellaswag_v1",
+  "rejection_reasons": [],
   "result_id": "LLaMA-3.1-8B:HellaSwag:validation:static_8bit:seed7",
   "routing_summary": null,
   "schema_version": "qaq.result.v1",

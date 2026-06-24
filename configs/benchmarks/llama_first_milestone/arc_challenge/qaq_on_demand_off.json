@@ -1,0 +1,30 @@
+{
+  "block_granularity": "mha_ffn",
+  "dataset": "arc_challenge",
+  "device": "cuda",
+  "gpu_ids": [
+    0
+  ],
+  "logging": {
+    "checkpoint_interval_steps": 500,
+    "console": true,
+    "log_dir": "runs/llama_first_milestone/arc_challenge/qaq_on_demand_off/logs",
+    "progress_interval_steps": 10
+  },
+  "max_bit_width": 8,
+  "metric": "exact_match",
+  "mode": "qaq_on_demand_off",
+  "model": "meta-llama/Llama-3.1-8B",
+  "notes": "First-milestone structural config for a real benchmark name. Not accepted until benchmark adapter, full tensor artifacts, GPU selector record, and all five mode result artifacts pass doc/acceptance-contract.md.",
+  "output_dir": "runs/llama_first_milestone/arc_challenge/qaq_on_demand_off",
+  "overwrite": false,
+  "precision_candidates": [
+    4,
+    8
+  ],
+  "prompt_format": "lm_eval:arc_challenge",
+  "router_checkpoint": "runs/llama_first_milestone/router/checkpoints/router_final.json",
+  "seed": 0,
+  "split": "validation",
+  "use_model_tokenizer": true
+}
