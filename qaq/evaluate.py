@@ -6,7 +6,7 @@ import json
 import sys
 from argparse import ArgumentParser
 
-from qaq.config import ConfigValidationError, load_config_file
+from qaq.config import ConfigValidationError, RunConfig, load_config_file
 from qaq.config import QAQ_MODES
 from qaq.results import ResultValidationError, build_result_artifact, save_result_artifact
 from qaq.runtime.adaptive import run_adaptive_runtime
@@ -42,6 +42,29 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Print the result artifact as JSON.",
     )
+    parser.add_argument(
+        "--max-examples",
+        type=int,
+        default=None,
+        help="Optional maximum number of benchmark examples to process.",
+    )
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Number of examples per streamed evaluation micro-batch.",
+    )
+    parser.add_argument(
+        "--hf-device-map",
+        choices=("single", "auto"),
+        default=None,
+        help="Optional Hugging Face device_map override for model loading.",
+    )
+    parser.add_argument(
+        "--hf-max-memory-per-gpu",
+        default=None,
+        help="Optional per-visible-GPU max_memory string for hf_device_map=auto, e.g. 22GiB.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -49,6 +72,8 @@ def main(argv: list[str] | None = None) -> int:
             args.config,
             validate_output=not args.skip_output_dir_check,
         )
+        cli_overrides = _cli_overrides(args)
+        config = _apply_cli_overrides(config, cli_overrides)
         artifact_refs = (
             load_artifact_index(args.artifact_index) if args.artifact_index else None
         )
@@ -56,6 +81,8 @@ def main(argv: list[str] | None = None) -> int:
             result = run_adaptive_runtime(config, artifact_refs=artifact_refs)
         else:
             result = run_static_runtime(config, artifact_refs=artifact_refs)
+        if cli_overrides:
+            result.metadata["cli_overrides"] = dict(cli_overrides)
         result_artifact = build_result_artifact(config, result)
         if args.result_output:
             save_result_artifact(result_artifact, args.result_output)
@@ -77,6 +104,28 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_result_json:
         print(json.dumps(result_artifact.as_dict(), indent=2, sort_keys=True))
     return 0
+
+
+def _cli_overrides(args: object) -> dict[str, object]:
+    overrides: dict[str, object] = {}
+    for arg_name, config_name in (
+        ("max_examples", "max_examples"),
+        ("eval_batch_size", "eval_batch_size"),
+        ("hf_device_map", "hf_device_map"),
+        ("hf_max_memory_per_gpu", "hf_max_memory_per_gpu"),
+    ):
+        value = getattr(args, arg_name)
+        if value is not None:
+            overrides[config_name] = value
+    return overrides
+
+
+def _apply_cli_overrides(config: RunConfig, overrides: dict[str, object]) -> RunConfig:
+    if not overrides:
+        return config
+    data = config.as_dict()
+    data.update(overrides)
+    return RunConfig.from_mapping(data, validate_output=False)
 
 
 if __name__ == "__main__":

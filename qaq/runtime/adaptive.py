@@ -14,10 +14,10 @@ from qaq.blocks import BlockDescriptor, block_map, discover_mha_ffn_blocks
 from qaq.config import QAQ_MODES, RunConfig
 from qaq.loader import LoaderError, LoaderRequest, OnDemandLoader
 from qaq.logging import LogEvent
-from qaq.model_adapter import load_model_adapter
+from qaq.model_adapter import HiddenStateBundle, ReferenceBatchOutput, load_model_adapter
 from qaq.precision_plan import PrecisionPlan
 from qaq.router.checkpoint import load_router_checkpoint
-from qaq.router.policy import route_hidden_states
+from qaq.router.policy import route_hidden_states, summarize_traces
 from qaq.router.types import RouterPolicyError
 from qaq.runtime.common import LatencyEvent, MemoryEvent, RuntimeError, RuntimeOutputBundle
 from qaq.runtime.weight_overrides import (
@@ -57,9 +57,14 @@ def run_adaptive_runtime(
         )
 
     start = perf_counter()
+    _reset_cuda_peak_memory_if_available(config)
     adapter = load_model_adapter(config)
-    examples = adapter.load_examples(config, limit=example_limit)
-    batch = adapter.build_batch(config, examples)
+    all_examples = adapter.load_examples(config)
+    examples, total_examples, subset_run = _select_examples(
+        all_examples,
+        config=config,
+        example_limit=example_limit,
+    )
     blocks = discover_mha_ffn_blocks(
         adapter.architecture_metadata,
         supported_bit_widths=config.precision_candidates,
@@ -68,55 +73,100 @@ def run_adaptive_runtime(
     checkpoint = load_router_checkpoint(config.router_checkpoint)
     _validate_checkpoint_runtime_metadata(config, checkpoint)
     block_ids = tuple(block.block_id for block in blocks)
-    routing_output = adapter.reference_forward(batch, block_ids=block_ids)
 
-    try:
-        routing = route_hidden_states(
-            checkpoint,
-            hidden_states=routing_output.hidden_states,
-            blocks=blocks,
-            model_id=config.model,
-            mode=config.mode,
-            query_ids=batch.example_ids,
-            diagnostic=config.router_diagnostic,
+    compact_routing_outputs: list[ReferenceBatchOutput] = []
+    query_batches = []
+    all_plans = []
+    all_traces = []
+    for chunk in _chunk_examples(examples, config.eval_batch_size):
+        batch = adapter.build_batch(config, chunk)
+        routing_output = adapter.reference_forward(
+            batch,
+            block_ids=block_ids,
+            collect_hidden_states=True,
+            store_full_logits=config.store_full_logits,
         )
-    except RouterPolicyError as exc:
-        raise RuntimeError(exc.code, exc.message) from exc
+        try:
+            routing = route_hidden_states(
+                checkpoint,
+                hidden_states=routing_output.hidden_states,
+                blocks=blocks,
+                model_id=config.model,
+                mode=config.mode,
+                query_ids=batch.example_ids,
+                diagnostic=config.router_diagnostic,
+            )
+        except RouterPolicyError as exc:
+            raise RuntimeError(exc.code, exc.message) from exc
+        all_plans.extend(routing.plans)
+        all_traces.extend(routing.traces)
+        compact_routing_outputs.append(_drop_hidden_states(routing_output))
+        for query_index in range(len(routing.plans)):
+            query_batches.append(slice_batch(batch, query_index))
 
-    _validate_selected_artifacts(config, blocks=blocks, plans=routing.plans)
-    _reset_cuda_peak_memory_if_available(config)
+    plans = tuple(all_plans)
+    traces = tuple(all_traces)
+    routing_summary = summarize_traces(
+        traces,
+        diagnostic=config.router_diagnostic,
+    )
+    _validate_selected_artifacts(config, blocks=blocks, plans=plans)
     reconstruction_records, loader_summary, loader_events = _materialize_adaptive_plans(
         config,
         blocks=blocks,
-        plans=routing.plans,
+        plans=plans,
     )
     mixed_weight_forward_applied = False
     mixed_weight_forward_reason = "not_attempted"
     weight_override_records: tuple[dict[str, Any], ...] = ()
-    raw_output = routing_output
+    raw_output = combine_reference_outputs(
+        tuple(compact_routing_outputs),
+        precision_label="qaq_routing_reference",
+        metadata_updates={
+            "eval_batch_size": config.eval_batch_size,
+            "processed_examples": len(examples),
+            "total_examples": total_examples,
+            "max_examples": config.max_examples,
+            "subset_run": subset_run,
+            "micro_batch_count": len(compact_routing_outputs),
+            "collect_hidden_states": False,
+            "full_logits_stored": config.store_full_logits,
+        },
+    )
     can_apply, reason = runtime_can_apply_weight_overrides(adapter, blocks)
     mixed_weight_forward_reason = reason
     if can_apply:
         raw_output, weight_override_records = _run_adaptive_weight_overridden_forward(
             config,
             adapter=adapter,
-            batch=batch,
+            query_batches=tuple(query_batches),
             blocks=blocks,
             block_ids=block_ids,
-            plans=routing.plans,
+            plans=plans,
         )
         mixed_weight_forward_applied = True
     elapsed = perf_counter() - start
     peak_gpu_memory_gb = _peak_gpu_memory_gb(config)
     memory_source = _memory_measurement_source(config)
-    first_plan = routing.plans[0]
+    first_plan = plans[0]
     adaptive_traces = _build_adaptive_traces(
-        plans=routing.plans,
-        routing_traces=routing.traces,
+        plans=plans,
+        routing_traces=traces,
         materialization_records=reconstruction_records,
         elapsed_seconds=elapsed,
         peak_gpu_memory_gb=peak_gpu_memory_gb,
         memory_measurement_source=memory_source,
+    )
+    raw_output.metadata.update(
+        {
+            "eval_batch_size": config.eval_batch_size,
+            "processed_examples": len(examples),
+            "total_examples": total_examples,
+            "max_examples": config.max_examples,
+            "subset_run": subset_run,
+            "micro_batch_count": len(compact_routing_outputs),
+            "peak_gpu_memory_gb": peak_gpu_memory_gb,
+        }
     )
     log_event = LogEvent.progress(
         run_id=run_id,
@@ -125,14 +175,14 @@ def run_adaptive_runtime(
         mode=config.mode,
         benchmark=config.dataset,
         processed_examples=len(examples),
-        total_examples=len(examples),
+        total_examples=total_examples,
         elapsed_seconds=elapsed,
         latency_seconds=elapsed,
         peak_gpu_memory_gb=peak_gpu_memory_gb,
         selected_gpu_ids=config.gpu_ids,
         details={
             "router_checkpoint": str(config.router_checkpoint),
-            "routing_summary": routing.summary.as_dict(),
+            "routing_summary": routing_summary.as_dict(),
             "loader_summary": loader_summary,
             "adaptive_trace_count": len(adaptive_traces),
         },
@@ -151,9 +201,9 @@ def run_adaptive_runtime(
         "router_checkpoint": str(config.router_checkpoint),
         "router_checkpoint_id": checkpoint.metadata.checkpoint_id,
         "router_checkpoint_loaded": True,
-        "routing_summary": routing.summary.as_dict(),
-        "routing_traces": [trace.as_dict() for trace in routing.traces],
-        "precision_plans": [plan.as_dict() for plan in routing.plans],
+        "routing_summary": routing_summary.as_dict(),
+        "routing_traces": [trace.as_dict() for trace in traces],
+        "precision_plans": [plan.as_dict() for plan in plans],
         "adaptive_traces": adaptive_traces,
         "loader_summary": loader_summary,
         "loader_events": loader_events,
@@ -166,6 +216,18 @@ def run_adaptive_runtime(
             config,
             mixed_weight_forward_applied=mixed_weight_forward_applied,
         ),
+        "eval_batch_size": config.eval_batch_size,
+        "processed_examples": len(examples),
+        "total_examples": total_examples,
+        "max_examples": config.max_examples,
+        "subset_run": subset_run,
+        "micro_batch_count": len(compact_routing_outputs),
+        "collect_hidden_states": True,
+        "store_full_logits": config.store_full_logits,
+        "hf_device_map": config.hf_device_map or "single",
+        "hf_max_memory_per_gpu": config.hf_max_memory_per_gpu,
+        "model_device_map": raw_output.metadata.get("model_device_map"),
+        "peak_gpu_memory_gb": peak_gpu_memory_gb,
     }
     return RuntimeOutputBundle(
         mode=config.mode,
@@ -190,8 +252,12 @@ def run_adaptive_runtime(
                 measurement_source=memory_source,
                 details={
                     "device": config.device,
-                    "routed_queries": len(routing.plans),
+                    "routed_queries": len(plans),
                     "reconstructed_blocks": len(reconstruction_records),
+                    "processed_examples": len(examples),
+                    "eval_batch_size": config.eval_batch_size,
+                    "micro_batch_count": len(compact_routing_outputs),
+                    "model_device_map": raw_output.metadata.get("model_device_map"),
                 },
             ),
         ),
@@ -199,7 +265,6 @@ def run_adaptive_runtime(
         metadata=metadata,
         log_events=(log_event.as_dict(),),
     )
-
 
 def validate_adaptive_acceptance_metadata(output: RuntimeOutputBundle) -> None:
     """Validate adaptive runtime evidence before any QAQ acceptance claim."""
@@ -247,6 +312,47 @@ def validate_adaptive_acceptance_metadata(output: RuntimeOutputBundle) -> None:
                 "missing_loader_activity",
                 "qaq_on_demand_on results require loader activity",
             )
+
+
+def _select_examples(
+    examples: tuple[Any, ...],
+    *,
+    config: RunConfig,
+    example_limit: int | None,
+) -> tuple[tuple[Any, ...], int, bool]:
+    limits = tuple(
+        limit for limit in (config.max_examples, example_limit) if limit is not None
+    )
+    limit = min(limits) if limits else None
+    selected = examples[:limit] if limit is not None else examples
+    return selected, len(examples), bool(limits or len(selected) < len(examples))
+
+
+def _chunk_examples(
+    examples: tuple[Any, ...],
+    batch_size: int,
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        examples[start : start + batch_size]
+        for start in range(0, len(examples), batch_size)
+    )
+
+
+def _drop_hidden_states(output: ReferenceBatchOutput) -> ReferenceBatchOutput:
+    return ReferenceBatchOutput(
+        logits=output.logits,
+        losses=output.losses,
+        predictions=output.predictions,
+        hidden_states=HiddenStateBundle(
+            feature_source=output.hidden_states.feature_source,
+            by_block={},
+        ),
+        metadata={
+            **output.metadata,
+            "collect_hidden_states": False,
+            "hidden_state_block_count": 0,
+        },
+    )
 
 
 def _attach_artifact_refs(
@@ -502,7 +608,7 @@ def _run_adaptive_weight_overridden_forward(
     config: RunConfig,
     *,
     adapter: Any,
-    batch: Any,
+    query_batches: tuple[Any, ...],
     blocks: tuple[BlockDescriptor, ...],
     block_ids: tuple[str, ...],
     plans: tuple[PrecisionPlan, ...],
@@ -510,8 +616,7 @@ def _run_adaptive_weight_overridden_forward(
     outputs = []
     all_override_records: list[dict[str, Any]] = []
     per_query_counts: dict[str, int] = {}
-    for query_index, plan in enumerate(plans):
-        query_batch = slice_batch(batch, query_index)
+    for query_batch, plan in zip(query_batches, plans, strict=True):
         weight_overrides, override_records = build_weight_overrides(
             config,
             blocks=blocks,
@@ -527,20 +632,22 @@ def _run_adaptive_weight_overridden_forward(
                 block_ids=block_ids,
                 weight_overrides=weight_overrides,
                 precision_label="qaq_selected_bitplane_weight_overrides",
+                collect_hidden_states=False,
+                store_full_logits=config.store_full_logits,
             )
         )
     combined = combine_reference_outputs(
         tuple(outputs),
-        batch=batch,
         precision_label="qaq_selected_bitplane_weight_overrides",
         metadata_updates={
             "mixed_precision_forward_applied": True,
             "execution_granularity": "per_query",
             "per_query_weight_override_counts": per_query_counts,
+            "eval_batch_size": config.eval_batch_size,
+            "max_examples": config.max_examples,
         },
     )
     return combined, tuple(all_override_records)
-
 
 def _build_adaptive_traces(
     *,

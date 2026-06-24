@@ -22,6 +22,7 @@ from qaq.runtime.weight_overrides import (
     artifact_paths_for_block,
     artifact_ref_mode,
     build_weight_overrides,
+    combine_reference_outputs,
     runtime_can_apply_weight_overrides,
 )
 from qaq.tensor_bitplanes import (
@@ -42,7 +43,7 @@ def run_static_runtime(
     run_id: str = "static-runtime-smoke",
     example_limit: int | None = None,
 ) -> RuntimeOutputBundle:
-    """Run FP16/static/fixed fake inference and return result-ready metadata."""
+    """Run FP16/static/fixed inference with streamed evaluation batches."""
 
     if config.mode not in STATIC_RUNTIME_MODES:
         raise RuntimeError(
@@ -51,9 +52,14 @@ def run_static_runtime(
         )
 
     start = perf_counter()
+    _reset_cuda_peak_memory_if_available(config)
     adapter = load_model_adapter(config)
-    examples = adapter.load_examples(config, limit=example_limit)
-    batch = adapter.build_batch(config, examples)
+    all_examples = adapter.load_examples(config)
+    examples, total_examples, subset_run = _select_examples(
+        all_examples,
+        config=config,
+        example_limit=example_limit,
+    )
     blocks = discover_mha_ffn_blocks(
         adapter.architecture_metadata,
         supported_bit_widths=config.precision_candidates,
@@ -74,7 +80,9 @@ def run_static_runtime(
     mixed_weight_forward_applied = False
     mixed_weight_forward_reason = "fp16_reference" if not require_artifacts else "not_attempted"
     weight_override_records: tuple[dict[str, Any], ...] = ()
+    weight_overrides: Mapping[str, Any] | None = None
     block_ids = tuple(block.block_id for block in blocks)
+    precision_label = "fp16_reference"
     if require_artifacts:
         can_apply, reason = runtime_can_apply_weight_overrides(adapter, blocks)
         mixed_weight_forward_reason = reason
@@ -84,18 +92,43 @@ def run_static_runtime(
                 blocks=blocks,
                 plan=plan,
             )
-            raw_output = adapter.reference_forward(
+            mixed_weight_forward_applied = True
+            precision_label = f"{config.mode}_bitplane_weight_overrides"
+        else:
+            precision_label = f"{config.mode}_reference_without_weight_overrides"
+
+    raw_outputs = []
+    for chunk in _chunk_examples(examples, config.eval_batch_size):
+        batch = adapter.build_batch(config, chunk)
+        raw_outputs.append(
+            adapter.reference_forward(
                 batch,
                 block_ids=block_ids,
                 weight_overrides=weight_overrides,
-                precision_label=f"{config.mode}_bitplane_weight_overrides",
+                precision_label=precision_label,
+                collect_hidden_states=config.collect_hidden_states,
+                store_full_logits=config.store_full_logits,
             )
-            mixed_weight_forward_applied = True
-        else:
-            raw_output = adapter.reference_forward(batch, block_ids=block_ids)
-    else:
-        raw_output = adapter.reference_forward(batch, block_ids=block_ids)
+        )
+
     elapsed = perf_counter() - start
+    peak_gpu_memory_gb = _peak_gpu_memory_gb(config)
+    raw_output = combine_reference_outputs(
+        tuple(raw_outputs),
+        precision_label=precision_label,
+        metadata_updates={
+            "eval_batch_size": config.eval_batch_size,
+            "processed_examples": len(examples),
+            "total_examples": total_examples,
+            "max_examples": config.max_examples,
+            "subset_run": subset_run,
+            "micro_batch_count": len(raw_outputs),
+            "collect_hidden_states": config.collect_hidden_states,
+            "full_logits_stored": config.store_full_logits,
+            "peak_gpu_memory_gb": peak_gpu_memory_gb,
+        },
+    )
+    model_device_map = raw_output.metadata.get("model_device_map")
     log_event = LogEvent.progress(
         run_id=run_id,
         module="static_runtime",
@@ -103,10 +136,10 @@ def run_static_runtime(
         mode=config.mode,
         benchmark=config.dataset,
         processed_examples=len(examples),
-        total_examples=len(examples),
+        total_examples=total_examples,
         elapsed_seconds=elapsed,
         latency_seconds=elapsed,
-        peak_gpu_memory_gb=0.0,
+        peak_gpu_memory_gb=peak_gpu_memory_gb,
         selected_gpu_ids=config.gpu_ids,
     )
     return RuntimeOutputBundle(
@@ -119,18 +152,22 @@ def run_static_runtime(
                 name="end_to_end",
                 elapsed_seconds=elapsed,
                 warmup_steps=0,
-                cache_policy="none_cpu_fake",
+                cache_policy="streamed_micro_batches",
             ),
         ),
         memory_events=(
             MemoryEvent(
                 name="peak_gpu_memory",
-                peak_gpu_memory_gb=0.0,
+                peak_gpu_memory_gb=peak_gpu_memory_gb,
                 selected_gpu_ids=config.gpu_ids,
-                measurement_source="cpu_fake_no_cuda",
+                measurement_source=_memory_measurement_source(config),
                 details={
                     "device": config.device,
                     "reconstructed_blocks": len(reconstruction_records),
+                    "processed_examples": len(examples),
+                    "eval_batch_size": config.eval_batch_size,
+                    "micro_batch_count": len(raw_outputs),
+                    "model_device_map": model_device_map,
                 },
             ),
         ),
@@ -157,10 +194,21 @@ def run_static_runtime(
                 adapter=adapter,
                 mixed_weight_forward_applied=mixed_weight_forward_applied,
             ),
+            "eval_batch_size": config.eval_batch_size,
+            "processed_examples": len(examples),
+            "total_examples": total_examples,
+            "max_examples": config.max_examples,
+            "subset_run": subset_run,
+            "micro_batch_count": len(raw_outputs),
+            "collect_hidden_states": config.collect_hidden_states,
+            "store_full_logits": config.store_full_logits,
+            "hf_device_map": config.hf_device_map or "single",
+            "hf_max_memory_per_gpu": config.hf_max_memory_per_gpu,
+            "model_device_map": model_device_map,
+            "peak_gpu_memory_gb": peak_gpu_memory_gb,
         },
         log_events=(log_event.as_dict(),),
     )
-
 
 def load_artifact_index(path: str | Path) -> dict[str, dict[str, str]]:
     """Load a block artifact index from JSON.
@@ -310,6 +358,77 @@ def _materialize_plan_artifacts(
                 }
             )
     return tuple(records)
+
+
+def _select_examples(
+    examples: tuple[Any, ...],
+    *,
+    config: RunConfig,
+    example_limit: int | None,
+) -> tuple[tuple[Any, ...], int, bool]:
+    limits = tuple(
+        limit for limit in (config.max_examples, example_limit) if limit is not None
+    )
+    limit = min(limits) if limits else None
+    selected = examples[:limit] if limit is not None else examples
+    return selected, len(examples), bool(limits or len(selected) < len(examples))
+
+
+def _chunk_examples(
+    examples: tuple[Any, ...],
+    batch_size: int,
+) -> tuple[tuple[Any, ...], ...]:
+    return tuple(
+        examples[start : start + batch_size]
+        for start in range(0, len(examples), batch_size)
+    )
+
+
+def _reset_cuda_peak_memory_if_available(config: RunConfig) -> None:
+    if config.device != "cuda":
+        return
+    torch = _try_import_torch()
+    if torch is None or not torch.cuda.is_available():
+        return
+    for index in _cuda_memory_indices(torch, config):
+        torch.cuda.reset_peak_memory_stats(index)
+
+
+def _peak_gpu_memory_gb(config: RunConfig) -> float:
+    if config.device != "cuda":
+        return 0.0
+    torch = _try_import_torch()
+    if torch is None or not torch.cuda.is_available():
+        return 0.0
+    indices = _cuda_memory_indices(torch, config)
+    if not indices:
+        return 0.0
+    peak_bytes = max(int(torch.cuda.max_memory_allocated(index)) for index in indices)
+    return peak_bytes / float(1024**3)
+
+
+def _cuda_memory_indices(torch: Any, config: RunConfig) -> tuple[int, ...]:
+    device_count = int(torch.cuda.device_count())
+    if device_count <= 0:
+        return ()
+    if config.hf_device_map == "auto":
+        return tuple(range(device_count))
+    selected = tuple(gpu_id for gpu_id in config.gpu_ids if 0 <= gpu_id < device_count)
+    return selected or (0,)
+
+
+def _memory_measurement_source(config: RunConfig) -> str:
+    if config.device == "cuda":
+        return "torch_cuda_max_memory_allocated"
+    return "cpu_fake_no_cuda"
+
+
+def _try_import_torch() -> Any | None:
+    try:
+        import torch
+    except ImportError:
+        return None
+    return torch
 
 
 def _static_runtime_impl(

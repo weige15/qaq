@@ -117,6 +117,12 @@ class RunConfig:
     prompt_format: str | None = None
     metric: str | None = None
     notes: str | None = None
+    max_examples: int | None = None
+    eval_batch_size: int = 1
+    collect_hidden_states: bool = False
+    store_full_logits: bool = False
+    hf_device_map: str | None = None
+    hf_max_memory_per_gpu: str | None = None
 
     @classmethod
     def from_mapping(
@@ -281,6 +287,39 @@ class RunConfig:
         prompt_format = _optional_string(data.get("prompt_format"), "prompt_format")
         metric = _optional_string(data.get("metric"), "metric")
         notes = _optional_string(data.get("notes"), "notes")
+        max_examples = _optional_positive_int(
+            data.get("max_examples"),
+            field="max_examples",
+        )
+        eval_batch_size = _coerce_int(
+            data.get("eval_batch_size", 1),
+            field="eval_batch_size",
+        )
+        if eval_batch_size <= 0:
+            raise ConfigValidationError(
+                "invalid_eval_batch_size",
+                "eval_batch_size must be positive",
+                "eval_batch_size",
+            )
+        collect_hidden_states = _coerce_bool(
+            data.get("collect_hidden_states", False),
+            field="collect_hidden_states",
+        )
+        store_full_logits = _coerce_bool(
+            data.get("store_full_logits", False),
+            field="store_full_logits",
+        )
+        hf_device_map = _optional_string(data.get("hf_device_map"), "hf_device_map")
+        if hf_device_map not in {None, "single", "auto"}:
+            raise ConfigValidationError(
+                "invalid_hf_device_map",
+                "hf_device_map must be null, 'single', or 'auto'",
+                "hf_device_map",
+            )
+        hf_max_memory_per_gpu = _optional_string(
+            data.get("hf_max_memory_per_gpu"),
+            "hf_max_memory_per_gpu",
+        )
 
         return cls(
             model=model,
@@ -304,6 +343,12 @@ class RunConfig:
             prompt_format=prompt_format,
             metric=metric,
             notes=notes,
+            max_examples=max_examples,
+            eval_batch_size=eval_batch_size,
+            collect_hidden_states=collect_hidden_states,
+            store_full_logits=store_full_logits,
+            hf_device_map=hf_device_map,
+            hf_max_memory_per_gpu=hf_max_memory_per_gpu,
         )
 
     def as_dict(self) -> dict[str, Any]:
@@ -331,6 +376,12 @@ class RunConfig:
             "prompt_format": self.prompt_format,
             "metric": self.metric,
             "notes": self.notes,
+            "max_examples": self.max_examples,
+            "eval_batch_size": self.eval_batch_size,
+            "collect_hidden_states": self.collect_hidden_states,
+            "store_full_logits": self.store_full_logits,
+            "hf_device_map": self.hf_device_map,
+            "hf_max_memory_per_gpu": self.hf_max_memory_per_gpu,
         }
 
 
@@ -508,6 +559,29 @@ def _coerce_int(value: Any, *, field: str) -> int:
         raise ConfigValidationError(
             "invalid_integer",
             "expected an integer",
+            field,
+        )
+    return value
+
+
+def _optional_positive_int(value: Any, *, field: str) -> int | None:
+    if value is None:
+        return None
+    result = _coerce_int(value, field=field)
+    if result <= 0:
+        raise ConfigValidationError(
+            "invalid_integer",
+            "expected a positive integer",
+            field,
+        )
+    return result
+
+
+def _coerce_bool(value: Any, *, field: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigValidationError(
+            "invalid_boolean",
+            "expected a boolean",
             field,
         )
     return value

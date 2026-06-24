@@ -166,23 +166,42 @@ def slice_batch(batch: TokenizedBenchmarkBatch, index: int) -> TokenizedBenchmar
 def combine_reference_outputs(
     outputs: tuple[ReferenceBatchOutput, ...],
     *,
-    batch: TokenizedBenchmarkBatch,
+    batch: TokenizedBenchmarkBatch | None = None,
     precision_label: str,
     metadata_updates: dict[str, Any],
 ) -> ReferenceBatchOutput:
     if not outputs:
-        raise RuntimeError("empty_runtime_output", "at least one per-query output is required")
+        raise RuntimeError("empty_runtime_output", "at least one runtime output is required")
     block_ids = tuple(outputs[0].hidden_states.by_block)
-    by_block = {
-        block_id: tuple(output.hidden_states.by_block[block_id][0] for output in outputs)
-        for block_id in block_ids
-    }
+    by_block: dict[str, tuple[tuple[float, ...], ...]] = {}
+    for block_id in block_ids:
+        vectors: list[tuple[float, ...]] = []
+        for output in outputs:
+            if block_id not in output.hidden_states.by_block:
+                raise RuntimeError(
+                    "inconsistent_hidden_states",
+                    f"combined output is missing hidden states for {block_id}",
+                )
+            vectors.extend(output.hidden_states.by_block[block_id])
+        by_block[block_id] = tuple(vectors)
+
+    if batch is not None:
+        batch_size = batch.metadata.batch_size
+        example_ids = list(batch.example_ids)
+    else:
+        batch_size = sum(len(output.predictions) for output in outputs)
+        example_ids = [
+            str(example_id)
+            for output in outputs
+            for example_id in output.metadata.get("example_ids", [])
+        ]
+
     metadata = dict(outputs[0].metadata)
     metadata.update(
         {
-            "batch_size": batch.metadata.batch_size,
+            "batch_size": batch_size,
             "precision": precision_label,
-            "example_ids": list(batch.example_ids),
+            "example_ids": example_ids,
         }
     )
     metadata.update(metadata_updates)

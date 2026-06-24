@@ -215,6 +215,8 @@ class FakeCausalLMAdapter:
         block_ids: tuple[str, ...] | None = None,
         weight_overrides: Mapping[str, Any] | None = None,
         precision_label: str | None = None,
+        collect_hidden_states: bool = True,
+        store_full_logits: bool = True,
     ) -> ReferenceBatchOutput:
         if weight_overrides:
             raise ModelAdapterError(
@@ -243,30 +245,39 @@ class FakeCausalLMAdapter:
                 active_length=active_length,
                 vocab_size=self.vocab_size,
             )
-            logits.append(row)
+            if store_full_logits:
+                logits.append(row)
+            else:
+                logits.append(())
             prediction = max(range(len(row)), key=row.__getitem__)
             predictions.append(prediction)
             losses.append(_target_loss(target=target, prediction=prediction))
 
-        hidden_states = HiddenStateBundle(
-            feature_source=self.feature_source,
-            by_block={
-                block_id: tuple(
-                    _hidden_feature(
-                        block_id=block_id,
-                        token_sum=token_sum,
-                        active_length=active_length,
-                        hidden_size=self.hidden_size,
+        if collect_hidden_states:
+            hidden_states = HiddenStateBundle(
+                feature_source=self.feature_source,
+                by_block={
+                    block_id: tuple(
+                        _hidden_feature(
+                            block_id=block_id,
+                            token_sum=token_sum,
+                            active_length=active_length,
+                            hidden_size=self.hidden_size,
+                        )
+                        for token_sum, active_length in zip(
+                            token_sums,
+                            active_lengths,
+                            strict=True,
+                        )
                     )
-                    for token_sum, active_length in zip(
-                        token_sums,
-                        active_lengths,
-                        strict=True,
-                    )
-                )
-                for block_id in resolved_block_ids
-            },
-        )
+                    for block_id in resolved_block_ids
+                },
+            )
+        else:
+            hidden_states = HiddenStateBundle(
+                feature_source=self.feature_source,
+                by_block={},
+            )
         return ReferenceBatchOutput(
             logits=tuple(logits),
             losses=tuple(losses),
@@ -281,6 +292,14 @@ class FakeCausalLMAdapter:
                 "feature_source": self.feature_source,
                 "precision": "fp16_reference",
                 "batch_size": batch.metadata.batch_size,
+                "example_ids": list(batch.example_ids),
+                "collect_hidden_states": collect_hidden_states,
+                "hidden_state_block_count": len(hidden_states.by_block),
+                "full_logits_stored": store_full_logits,
+                "logit_row_width": self.vocab_size if store_full_logits else 0,
+                "peak_gpu_memory_bytes": 0,
+                "peak_gpu_memory_gb": 0.0,
+                "model_device_map": None,
             },
         )
 
@@ -321,6 +340,8 @@ class HuggingFaceCausalLMAdapter:
         hf_config: Any,
         requested_device: str,
         gpu_ids: tuple[int, ...],
+        hf_device_map: str | None = None,
+        hf_max_memory_per_gpu: str | None = None,
     ) -> None:
         self.model_ref = model_ref
         self.model_id = model_id
@@ -328,6 +349,8 @@ class HuggingFaceCausalLMAdapter:
         self.hf_config = hf_config
         self.requested_device = requested_device
         self.gpu_ids = gpu_ids
+        self.hf_device_map = hf_device_map
+        self.hf_max_memory_per_gpu = hf_max_memory_per_gpu
         self.num_layers = _coerce_positive_int(
             getattr(hf_config, "num_hidden_layers", None),
             field="num_hidden_layers",
@@ -389,18 +412,20 @@ class HuggingFaceCausalLMAdapter:
         block_ids: tuple[str, ...] | None = None,
         weight_overrides: Mapping[str, Any] | None = None,
         precision_label: str | None = None,
+        collect_hidden_states: bool = True,
+        store_full_logits: bool = True,
     ) -> ReferenceBatchOutput:
         torch = _import_torch()
         model = self._ensure_model_loaded()
         with _temporary_weight_overrides(model, weight_overrides or {}, torch=torch):
-            device = next(model.parameters()).device
+            device = _resolve_model_input_device(model, torch=torch)
             input_ids = torch.tensor(batch.input_ids, dtype=torch.long, device=device)
             attention_mask = torch.tensor(batch.attention_mask, dtype=torch.long, device=device)
-            with torch.no_grad():
+            with _inference_context(torch):
                 output = model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    output_hidden_states=True,
+                    output_hidden_states=collect_hidden_states,
                     use_cache=False,
                 )
             target_losses = _hf_target_language_model_losses(
@@ -415,22 +440,43 @@ class HuggingFaceCausalLMAdapter:
         logits: list[tuple[float, ...]] = []
         predictions: list[int] = []
         for row_index, active_length in enumerate(active_lengths):
-            row_logits = output.logits[row_index, active_length - 1].detach().float().cpu()
+            row_logits = output.logits[row_index, active_length - 1].detach()
             predictions.append(int(torch.argmax(row_logits).item()))
-            logits.append(tuple(float(value) for value in row_logits.tolist()))
+            if store_full_logits:
+                logits.append(tuple(float(value) for value in row_logits.float().cpu().tolist()))
+            else:
+                logits.append(())
 
         resolved_block_ids = block_ids or _default_block_ids(self.num_layers)
-        hidden_by_layer = _pooled_hidden_by_layer(
-            output.hidden_states,
-            attention_mask=attention_mask,
-            active_lengths=active_lengths,
-        )
-        hidden_states = HiddenStateBundle(
-            feature_source=self.feature_source,
-            by_block={
-                block_id: tuple(hidden_by_layer[_layer_index_from_block_id(block_id)])
-                for block_id in resolved_block_ids
-            },
+        if collect_hidden_states:
+            hidden_state_output = getattr(output, "hidden_states", None)
+            if hidden_state_output is None:
+                raise ModelAdapterError(
+                    "missing_hidden_states",
+                    "Hugging Face output did not include hidden states for router feature extraction",
+                )
+            hidden_by_layer = _pooled_hidden_by_layer(
+                hidden_state_output,
+                attention_mask=attention_mask,
+                active_lengths=active_lengths,
+            )
+            hidden_states = HiddenStateBundle(
+                feature_source=self.feature_source,
+                by_block={
+                    block_id: tuple(hidden_by_layer[_layer_index_from_block_id(block_id)])
+                    for block_id in resolved_block_ids
+                },
+            )
+        else:
+            hidden_states = HiddenStateBundle(
+                feature_source=self.feature_source,
+                by_block={},
+            )
+        peak_gpu_memory_bytes = _peak_cuda_memory_allocated_bytes(
+            torch,
+            model=model,
+            gpu_ids=self.gpu_ids,
+            hf_device_map=self.hf_device_map,
         )
         return ReferenceBatchOutput(
             logits=tuple(logits),
@@ -446,6 +492,7 @@ class HuggingFaceCausalLMAdapter:
                 "feature_source": self.feature_source,
                 "precision": precision_label or "hf_reference",
                 "batch_size": batch.metadata.batch_size,
+                "example_ids": list(batch.example_ids),
                 "weight_override_count": len(weight_overrides or {}),
                 "loss_source": (
                     "hf_target_token_nll"
@@ -453,6 +500,16 @@ class HuggingFaceCausalLMAdapter:
                     else "none_no_targets"
                 ),
                 "target_loss_count": sum(loss is not None for loss in target_losses),
+                "collect_hidden_states": collect_hidden_states,
+                "hidden_state_block_count": len(hidden_states.by_block),
+                "full_logits_stored": store_full_logits,
+                "logit_row_width": self.vocab_size if store_full_logits else 0,
+                "hf_device_map": self.hf_device_map or "single",
+                "hf_max_memory_per_gpu": self.hf_max_memory_per_gpu,
+                "model_device_map": _serialized_model_device_map(model),
+                "input_device": str(device),
+                "peak_gpu_memory_bytes": peak_gpu_memory_bytes,
+                "peak_gpu_memory_gb": peak_gpu_memory_bytes / float(1024**3),
             },
         )
 
@@ -461,24 +518,60 @@ class HuggingFaceCausalLMAdapter:
             return self._model
         torch = _import_torch()
         transformers = _import_transformers()
-        device = _resolve_torch_device(
+        device_map_mode = self.hf_device_map or "single"
+        dtype = _resolve_hf_dtype(
             torch,
+            hf_config=self.hf_config,
             requested_device=self.requested_device,
-            gpu_ids=self.gpu_ids,
         )
-        dtype = torch.bfloat16 if str(device).startswith("cuda") else torch.float32
-        try:
-            model = transformers.AutoModelForCausalLM.from_pretrained(
-                self.model_ref,
-                local_files_only=True,
-                torch_dtype=dtype,
+        load_kwargs: dict[str, Any] = {
+            "local_files_only": True,
+            "dtype": dtype,
+        }
+        if device_map_mode == "auto":
+            if self.requested_device != "cuda":
+                raise ModelAdapterError(
+                    "invalid_hf_device_map",
+                    "hf_device_map='auto' requires config device='cuda'",
+                )
+            if not torch.cuda.is_available():
+                raise ModelAdapterError(
+                    "cuda_unavailable",
+                    "hf_device_map='auto' requires visible CUDA devices",
+                )
+            load_kwargs["device_map"] = "auto"
+            max_memory = _hf_max_memory_map(torch, self.hf_max_memory_per_gpu)
+            if max_memory is not None:
+                load_kwargs["max_memory"] = max_memory
+            target_device = None
+        else:
+            target_device = _resolve_torch_device(
+                torch,
+                requested_device=self.requested_device,
+                gpu_ids=self.gpu_ids,
             )
+        try:
+            try:
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    self.model_ref,
+                    **load_kwargs,
+                )
+            except TypeError as exc:
+                if "dtype" not in str(exc):
+                    raise
+                legacy_kwargs = dict(load_kwargs)
+                legacy_kwargs["torch_dtype"] = legacy_kwargs.pop("dtype")
+                model = transformers.AutoModelForCausalLM.from_pretrained(
+                    self.model_ref,
+                    **legacy_kwargs,
+                )
         except Exception as exc:
             raise ModelAdapterError(
                 "model_load_failed",
                 f"failed to load Hugging Face model {self.model_ref!r} from local files: {exc}",
             ) from exc
-        model.to(device)
+        if target_device is not None:
+            model.to(target_device)
         model.eval()
         self._model = model
         self._parameter_views = tuple(
@@ -566,6 +659,8 @@ def load_model_adapter(config: RunConfig) -> Any:
         hf_config=hf_config,
         requested_device=config.device,
         gpu_ids=config.gpu_ids,
+        hf_device_map=config.hf_device_map,
+        hf_max_memory_per_gpu=config.hf_max_memory_per_gpu,
     )
 
 
@@ -863,7 +958,7 @@ def _hf_target_language_model_losses(
         dtype=torch.long,
         device=device,
     )
-    with torch.no_grad():
+    with _inference_context(torch):
         output = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -971,6 +1066,120 @@ def _resolve_torch_device(
         "unsupported_device",
         "Hugging Face adapter supports only cpu or cuda devices",
     )
+
+
+def _resolve_hf_dtype(
+    torch: Any,
+    *,
+    hf_config: Any,
+    requested_device: str,
+) -> Any:
+    if requested_device == "cuda":
+        dtype_hint = str(getattr(hf_config, "torch_dtype", "")).lower()
+        if "bfloat16" in dtype_hint and hasattr(torch, "bfloat16"):
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
+def _hf_max_memory_map(torch: Any, per_gpu: str | None) -> dict[int, str] | None:
+    if per_gpu is None:
+        return None
+    if not torch.cuda.is_available():
+        return None
+    return {index: per_gpu for index in range(torch.cuda.device_count())}
+
+
+def _resolve_model_input_device(model: Any, *, torch: Any) -> Any:
+    get_embeddings = getattr(model, "get_input_embeddings", None)
+    if callable(get_embeddings):
+        embeddings = get_embeddings()
+        if embeddings is not None:
+            try:
+                return next(embeddings.parameters()).device
+            except (AttributeError, StopIteration):
+                pass
+
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, Mapping):
+        for value in device_map.values():
+            device = _device_from_map_value(value, torch=torch)
+            if device is not None and str(device).startswith("cuda"):
+                return device
+        for value in device_map.values():
+            device = _device_from_map_value(value, torch=torch)
+            if device is not None:
+                return device
+
+    try:
+        return next(model.parameters()).device
+    except StopIteration as exc:
+        raise ModelAdapterError(
+            "model_has_no_parameters",
+            "cannot infer a device for Hugging Face model inputs",
+        ) from exc
+
+
+def _device_from_map_value(value: Any, *, torch: Any) -> Any | None:
+    if isinstance(value, int):
+        return torch.device(f"cuda:{value}")
+    if isinstance(value, str):
+        if value == "disk":
+            return None
+        try:
+            return torch.device(value)
+        except Exception:
+            return None
+    return None
+
+
+def _serialized_model_device_map(model: Any) -> dict[str, str] | None:
+    device_map = getattr(model, "hf_device_map", None)
+    if isinstance(device_map, Mapping):
+        return {str(name): str(device) for name, device in device_map.items()}
+    try:
+        return {"__single_device__": str(next(model.parameters()).device)}
+    except StopIteration:
+        return None
+
+
+def _peak_cuda_memory_allocated_bytes(
+    torch: Any,
+    *,
+    model: Any,
+    gpu_ids: tuple[int, ...],
+    hf_device_map: str | None,
+) -> int:
+    if not torch.cuda.is_available():
+        return 0
+    device_count = int(torch.cuda.device_count())
+    if device_count <= 0:
+        return 0
+    if hf_device_map == "auto":
+        indices = tuple(range(device_count))
+    else:
+        indices = _model_cuda_device_indices(model) or tuple(gpu_ids)
+    valid_indices = tuple(index for index in indices if 0 <= index < device_count)
+    if not valid_indices:
+        valid_indices = (0,)
+    return max(int(torch.cuda.max_memory_allocated(index)) for index in valid_indices)
+
+
+def _model_cuda_device_indices(model: Any) -> tuple[int, ...]:
+    indices: list[int] = []
+    for parameter in model.parameters():
+        device = getattr(parameter, "device", None)
+        if str(device).startswith("cuda"):
+            index = getattr(device, "index", None)
+            indices.append(0 if index is None else int(index))
+    return tuple(dict.fromkeys(indices))
+
+
+def _inference_context(torch: Any) -> Any:
+    inference_mode = getattr(torch, "inference_mode", None)
+    if callable(inference_mode):
+        return inference_mode()
+    return torch.no_grad()
 
 
 def _pooled_hidden_by_layer(

@@ -299,3 +299,17 @@
 - Evidence: `python -m py_compile qaq/data.py qaq/benchmark_adapter.py` passed.
 - Evidence: `python -m pytest -q tests/integration/test_model_adapter_smoke.py` passed with 8 tests.
 - Remaining limitation: this fixes benchmark-name data resolution only. It is not lm-evaluation-harness integration and not accepted benchmark evidence until a real data file/cache, all five modes, GPU selector records, metrics, and `qaq.report` acceptance are present.
+
+### 2026-06-25T00:41:38+08:00
+
+- Continued the Evaluation Metrics / Static Runtime / Model and Benchmark Adapter workstreams to repair the real HellaSwag FP16 OOM path without adding torchrun/DDP.
+- Added evaluator config fields and `qaq.evaluate` CLI overrides for `max_examples`, `eval_batch_size`, `hf_device_map`, and `hf_max_memory_per_gpu`; CLI overrides are copied into result runtime metadata.
+- Updated static and adaptive evaluation to stream examples through `eval_batch_size` micro-batches, aggregate compact predictions/losses, avoid full hidden-state and full-logit retention by default outside router feature extraction, and record processed/total examples, subset/debug status, micro-batch count, peak CUDA memory, and model device map metadata.
+- Updated the Hugging Face adapter to support compact forwards, `torch.inference_mode()`, peak CUDA memory metadata, and single-process Transformers `device_map="auto"` sharding without a post-load `model.to(...)` call.
+- Updated result acceptance so `max_examples`/subset runs are marked `subset_debug_run` and cannot be accepted as full benchmark evidence.
+- Updated `doc/benchmark-integration-plan.md` to document that ordinary torchrun/DDP is intentionally out of scope because it replicates the model unless a tensor-parallel path is implemented; future Transformers `tp_plan="auto"` support remains out of scope.
+- Evidence: `python -m py_compile qaq/config.py qaq/evaluate.py qaq/model_adapter.py qaq/runtime/adaptive.py qaq/runtime/static.py qaq/runtime/weight_overrides.py qaq/results.py` passed.
+- Evidence: focused tests passed with `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py` (`48 passed`).
+- Evidence: adaptive streaming smoke coverage passed with `python -m pytest -q tests/integration/test_mixed_weight_runtime.py tests/e2e/test_smoke_modes.py` (`6 passed`).
+- Evidence: requested local verification passed with `python -m pytest -q tests/unit tests/integration` (`131 passed`).
+- Remaining limitation: no real HellaSwag benchmark, large-model load, GPU memory benchmark, or full FP16/static/QAQ comparison was run locally. Real evidence still requires lab RTX 3090 execution through `scripts/gpu_run.py`.

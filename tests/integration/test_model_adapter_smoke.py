@@ -355,6 +355,126 @@ def test_huggingface_adapter_returns_target_token_losses_without_real_checkpoint
         "layer_001.ffn",
     }
 
+    compact = adapter.reference_forward(
+        batch,
+        block_ids=(
+            "layer_000.mha",
+            "layer_000.ffn",
+            "layer_001.mha",
+            "layer_001.ffn",
+        ),
+        collect_hidden_states=False,
+        store_full_logits=False,
+    )
+
+    assert compact.logits == tuple(() for _ in examples)
+    assert compact.hidden_states.by_block == {}
+    assert compact.metadata["collect_hidden_states"] is False
+    assert compact.metadata["hidden_state_block_count"] == 0
+    assert compact.metadata["full_logits_stored"] is False
+    assert compact.metadata["logit_row_width"] == 0
+    assert compact.metadata["peak_gpu_memory_bytes"] == 0
+    assert compact.metadata["model_device_map"] == {"__single_device__": "cpu"}
+
+
+def test_huggingface_device_map_auto_load_does_not_call_model_to(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeCuda:
+        @staticmethod
+        def is_available() -> bool:
+            return True
+
+        @staticmethod
+        def device_count() -> int:
+            return 2
+
+    class FakeTorch:
+        cuda = FakeCuda()
+        bfloat16 = "bfloat16"
+        float16 = "float16"
+        float32 = "float32"
+
+        @staticmethod
+        def device(value: str) -> str:
+            return value
+
+    class FakeParameter:
+        requires_grad = False
+
+    class FakeHFModel:
+        hf_device_map = {
+            "model.embed_tokens": "cuda:0",
+            "model.layers.0": "cuda:1",
+        }
+
+        def __init__(self) -> None:
+            self.parameter = FakeParameter()
+            self.to_called = False
+            self.eval_called = False
+
+        def to(self, device: object) -> None:
+            self.to_called = True
+            raise AssertionError(f"model.to({device}) should not be called for device_map=auto")
+
+        def eval(self) -> None:
+            self.eval_called = True
+
+        def named_parameters(self):
+            return (("anchor", self.parameter),)
+
+        def parameters(self):
+            return iter((self.parameter,))
+
+    fake_model = FakeHFModel()
+    captured: dict[str, object] = {}
+
+    class FakeAutoModelForCausalLM:
+        @staticmethod
+        def from_pretrained(model_ref: str, **kwargs: object) -> FakeHFModel:
+            captured["model_ref"] = model_ref
+            captured["kwargs"] = kwargs
+            return fake_model
+
+    class FakeTransformers:
+        AutoModelForCausalLM = FakeAutoModelForCausalLM
+
+    monkeypatch.setattr("qaq.model_adapter._import_torch", lambda: FakeTorch)
+    monkeypatch.setattr("qaq.model_adapter._import_transformers", lambda: FakeTransformers)
+
+    adapter = HuggingFaceCausalLMAdapter(
+        model_ref="local-llama",
+        model_id="meta-llama/Llama-3.1-8B",
+        tokenizer=FakeTokenizer("tiny-hf-tokenizer", model_max_length=64),
+        hf_config=type(
+            "TinyConfig",
+            (),
+            {
+                "num_hidden_layers": 1,
+                "hidden_size": 4,
+                "vocab_size": 256,
+                "torch_dtype": "float16",
+            },
+        )(),
+        requested_device="cuda",
+        gpu_ids=(0, 1),
+        hf_device_map="auto",
+        hf_max_memory_per_gpu="22GiB",
+    )
+
+    assert len(adapter.parameters()) == 1
+
+    assert fake_model.to_called is False
+    assert fake_model.eval_called is True
+    assert captured["model_ref"] == "local-llama"
+    assert captured["kwargs"] == {
+        "local_files_only": True,
+        "dtype": "float16",
+        "device_map": "auto",
+        "max_memory": {0: "22GiB", 1: "22GiB"},
+    }
+
 
 def test_unavailable_model_and_dataset_fail_clearly(tmp_path: Path) -> None:
     missing_model_config = _config(

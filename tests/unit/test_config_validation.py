@@ -121,6 +121,34 @@ def test_loads_config_with_model_tokenizer_fallback() -> None:
     assert config.metric == "perplexity"
 
 
+def test_evaluator_config_fields_validate_and_serialize(tmp_path: Path) -> None:
+    data = base_config(tmp_path)
+    data.update(
+        {
+            "max_examples": 16,
+            "eval_batch_size": 2,
+            "collect_hidden_states": False,
+            "store_full_logits": False,
+            "hf_device_map": "auto",
+            "hf_max_memory_per_gpu": "22GiB",
+        }
+    )
+
+    config = RunConfig.from_mapping(data, available_gpu_count=8)
+    payload = config.as_dict()
+
+    assert config.max_examples == 16
+    assert config.eval_batch_size == 2
+    assert config.collect_hidden_states is False
+    assert config.store_full_logits is False
+    assert config.hf_device_map == "auto"
+    assert config.hf_max_memory_per_gpu == "22GiB"
+    assert payload["max_examples"] == 16
+    assert payload["eval_batch_size"] == 2
+    assert payload["hf_device_map"] == "auto"
+    assert payload["hf_max_memory_per_gpu"] == "22GiB"
+
+
 def test_loads_toml_config_stub(tmp_path: Path) -> None:
     config = load_config_file(
         "configs/smoke.toml",
@@ -179,6 +207,11 @@ def test_config_cli_returns_validation_exit_code_for_invalid_config() -> None:
         ("gpu_ids", [-1], "invalid_gpu_ids"),
         ("gpu_ids", [0, 0], "invalid_gpu_ids"),
         ("block_granularity", "global", "invalid_block_granularity"),
+        ("eval_batch_size", 0, "invalid_eval_batch_size"),
+        ("max_examples", 0, "invalid_integer"),
+        ("collect_hidden_states", "no", "invalid_boolean"),
+        ("store_full_logits", "no", "invalid_boolean"),
+        ("hf_device_map", "ddp", "invalid_hf_device_map"),
     ],
 )
 def test_invalid_config_fields_fail(

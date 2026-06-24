@@ -7,8 +7,10 @@ from qaq.artifacts import save_bitplane_artifact
 from qaq.bitplanes import create_bitplane_artifact_from_quantized_values
 from qaq.blocks import discover_mha_ffn_blocks
 from qaq.config import RunConfig
+from qaq.evaluate import main as evaluate_main
 from qaq.model_adapter import load_model_adapter
 from qaq.precision_plan import PrecisionPlanError
+from qaq.results import build_result_artifact
 from qaq.runtime.common import RuntimeError
 from qaq.runtime.static import run_static_runtime, validate_required_static_baselines
 
@@ -137,3 +139,87 @@ def test_missing_static_baselines_reject_qaq_acceptance() -> None:
         validate_required_static_baselines({"fp16", "static_8bit"})
 
     assert exc.value.code == "missing_static_baseline"
+
+
+def test_static_runtime_streams_multiple_micro_batches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _config(tmp_path, "fp16", eval_batch_size=1)
+    adapter = load_model_adapter(config)
+    batch_sizes: list[int] = []
+    original_build_batch = adapter.build_batch
+
+    def recording_build_batch(*args, **kwargs):
+        batch = original_build_batch(*args, **kwargs)
+        batch_sizes.append(batch.metadata.batch_size)
+        if batch.metadata.batch_size > 1:
+            raise AssertionError("runtime built a full validation batch")
+        return batch
+
+    adapter.build_batch = recording_build_batch
+    monkeypatch.setattr("qaq.runtime.static.load_model_adapter", lambda _config: adapter)
+
+    output = run_static_runtime(config)
+
+    assert batch_sizes == [1, 1]
+    assert output.raw_output.predictions and len(output.raw_output.predictions) == 2
+    assert output.raw_output.logits == ((), ())
+    assert output.raw_output.hidden_states.by_block == {}
+    assert output.metadata["eval_batch_size"] == 1
+    assert output.metadata["processed_examples"] == 2
+    assert output.metadata["total_examples"] == 2
+    assert output.metadata["micro_batch_count"] == 2
+    assert output.metadata["peak_gpu_memory_gb"] == 0.0
+    assert "model_device_map" in output.metadata
+
+
+def test_max_examples_marks_subset_run_and_rejects_full_acceptance(tmp_path: Path) -> None:
+    config = _config(tmp_path, "fp16", max_examples=1, eval_batch_size=1)
+
+    output = run_static_runtime(config)
+    artifact = build_result_artifact(config, output)
+
+    assert output.metadata["processed_examples"] == 1
+    assert output.metadata["total_examples"] == 2
+    assert output.metadata["max_examples"] == 1
+    assert output.metadata["subset_run"] is True
+    assert artifact.accepted_as_qaq_result is False
+    assert "subset_debug_run" in artifact.rejection_reasons
+
+
+def test_evaluate_cli_records_streaming_overrides(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    config = _config(tmp_path, "fp16")
+    config_path = tmp_path / "config.json"
+    config_path.write_text(json.dumps(config.as_dict()), encoding="utf-8")
+
+    exit_code = evaluate_main(
+        [
+            "--config",
+            str(config_path),
+            "--skip-output-dir-check",
+            "--max-examples",
+            "1",
+            "--eval-batch-size",
+            "1",
+            "--hf-device-map",
+            "single",
+            "--print-result-json",
+        ]
+    )
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+
+    assert exit_code == 0
+    runtime_metadata = payload["metadata"]["runtime_metadata"]
+    assert runtime_metadata["cli_overrides"] == {
+        "eval_batch_size": 1,
+        "hf_device_map": "single",
+        "max_examples": 1,
+    }
+    assert runtime_metadata["processed_examples"] == 1
+    assert runtime_metadata["subset_run"] is True

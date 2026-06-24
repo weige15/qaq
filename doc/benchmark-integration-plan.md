@@ -31,6 +31,14 @@ Use `lm-evaluation-harness` as the first optional benchmark backend, then wire Q
 - WikiText-2: `wikitext2`, split `test`, metric `perplexity`.
 - PTB: TODO. The current repo-native benchmark path only supports built-in fake/local datasets or JSON/JSONL files. Add a PTB adapter or lm-eval task mapping before creating accepted PTB configs.
 
+## Evaluation Runtime Notes
+
+`qaq.evaluate` streams benchmark examples in `eval_batch_size` micro-batches and defaults to compact FP16/static baseline outputs: hidden states and full vocabulary logits are not retained unless the config explicitly enables `collect_hidden_states` or `store_full_logits`. This is required for real HellaSwag-style validation runs on 24 GiB RTX 3090 GPUs because building one full validation batch or storing full logits for every example can OOM before the benchmark result is written.
+
+For multi-GPU model memory relief, use the single-process Hugging Face sharding path with `--hf-device-map auto` or `hf_device_map: "auto"`. Launch it through `scripts/gpu_run.py --count 2 ... -- python -m qaq.evaluate ...`; `gpu_run.py` selects physical RTX 3090s and exposes them as logical CUDA devices inside the child process, and Transformers owns the model shard placement.
+
+Do not use ordinary `torchrun`/DDP for this path yet. Standard DDP starts one process per GPU and replicates the model in each process, so it does not solve a single-model memory OOM unless a separate tensor-parallel implementation is added. Future tensor-parallel support may use Transformers `tp_plan="auto"`, but that is out of scope for the current evaluation repair.
+
 ## Command Templates
 
 Run real experiments only on the lab RTX 3090 server through the GPU selector. Example templates:

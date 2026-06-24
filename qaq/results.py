@@ -813,6 +813,7 @@ def _is_diagnostic_result(config: RunConfig, output: RuntimeOutputBundle) -> boo
             isinstance(routing_summary, dict) and routing_summary.get("diagnostic") is True,
             config.model.startswith(("fake-", "fake_")),
             config.device == "cpu",
+            output.metadata.get("subset_run") is True,
             "fake" in runtime_impl,
             "cpu" in runtime_impl,
         )
@@ -898,6 +899,8 @@ def _contract_rejection_reasons(
         metadata=metadata,
     ):
         reasons.append("smoke_fixture_or_synthetic_data")
+    if _is_subset_debug_run(metadata):
+        reasons.append("subset_debug_run")
     if mode == "fixed_mixed":
         reasons.append("fixed_mixed_diagnostic_mode")
     if mode in MIXED_PRECISION_REQUIRED_MODES:
@@ -918,6 +921,7 @@ def _evidence_level_for_rejections(reasons: Sequence[str]) -> str:
         "fake_dataset",
         "fake_model",
         "smoke_fixture_or_synthetic_data",
+        "subset_debug_run",
         "fixed_mixed_diagnostic_mode",
     }
     if any(reason in diagnostic_reasons for reason in reasons):
@@ -999,6 +1003,19 @@ def _is_fake_model(model: str) -> bool:
         token in lowered
         for token in ("fake", "smoke", "fixture", "synthetic", "toy", "tiny")
     ) or "tests/fixtures" in str(path)
+
+
+def _is_subset_debug_run(metadata: Mapping[str, Any]) -> bool:
+    runtime_metadata = metadata.get("runtime_metadata")
+    raw_output_metadata = metadata.get("raw_output_metadata")
+    for value in (runtime_metadata, raw_output_metadata):
+        if not isinstance(value, Mapping):
+            continue
+        if value.get("subset_run") is True:
+            return True
+        if value.get("max_examples") is not None:
+            return True
+    return False
 
 
 def _uses_smoke_fixture_or_synthetic_data(
