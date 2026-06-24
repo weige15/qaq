@@ -17,6 +17,13 @@ from qaq.logging import LogEvent
 from qaq.model_adapter import load_model_adapter
 from qaq.precision_plan import PrecisionPlan, build_precision_plan
 from qaq.runtime.common import LatencyEvent, MemoryEvent, RuntimeError, RuntimeOutputBundle
+from qaq.runtime.weight_overrides import (
+    adapter_supports_weight_overrides,
+    artifact_paths_for_block,
+    artifact_ref_mode,
+    build_weight_overrides,
+    runtime_can_apply_weight_overrides,
+)
 from qaq.tensor_bitplanes import (
     is_tensor_bitplane_artifact_path,
     load_tensor_bitplane_artifact,
@@ -64,10 +71,30 @@ def run_static_runtime(
     reconstruction_records = (
         _materialize_plan_artifacts(config, blocks, plan) if require_artifacts else ()
     )
-    raw_output = adapter.reference_forward(
-        batch,
-        block_ids=tuple(block.block_id for block in blocks),
-    )
+    mixed_weight_forward_applied = False
+    mixed_weight_forward_reason = "fp16_reference" if not require_artifacts else "not_attempted"
+    weight_override_records: tuple[dict[str, Any], ...] = ()
+    block_ids = tuple(block.block_id for block in blocks)
+    if require_artifacts:
+        can_apply, reason = runtime_can_apply_weight_overrides(adapter, blocks)
+        mixed_weight_forward_reason = reason
+        if can_apply:
+            weight_overrides, weight_override_records = build_weight_overrides(
+                config,
+                blocks=blocks,
+                plan=plan,
+            )
+            raw_output = adapter.reference_forward(
+                batch,
+                block_ids=block_ids,
+                weight_overrides=weight_overrides,
+                precision_label=f"{config.mode}_bitplane_weight_overrides",
+            )
+            mixed_weight_forward_applied = True
+        else:
+            raw_output = adapter.reference_forward(batch, block_ids=block_ids)
+    else:
+        raw_output = adapter.reference_forward(batch, block_ids=block_ids)
     elapsed = perf_counter() - start
     log_event = LogEvent.progress(
         run_id=run_id,
@@ -120,14 +147,27 @@ def run_static_runtime(
             "seed": config.seed,
             "selected_gpu_ids": list(config.gpu_ids),
             "fixed_mixed_is_diagnostic": config.mode == "fixed_mixed",
-            "runtime_impl": "qaq.runtime.static.fake_cpu",
+            "artifact_ref_mode": artifact_ref_mode(blocks) if require_artifacts else "none",
+            "mixed_precision_forward_applied": mixed_weight_forward_applied,
+            "mixed_precision_forward_reason": mixed_weight_forward_reason,
+            "weight_override_tensor_count": len(weight_override_records),
+            "weight_override_records": list(weight_override_records),
+            "runtime_impl": _static_runtime_impl(
+                config,
+                adapter=adapter,
+                mixed_weight_forward_applied=mixed_weight_forward_applied,
+            ),
         },
         log_events=(log_event.as_dict(),),
     )
 
 
 def load_artifact_index(path: str | Path) -> dict[str, dict[str, str]]:
-    """Load a block -> bit-width -> artifact path mapping from JSON."""
+    """Load a block artifact index from JSON.
+
+    Supported shapes are legacy ``block -> bit-width -> artifact path`` and
+    tensor-native ``block -> tensor_name -> artifact path``.
+    """
 
     index_path = Path(path)
     try:
@@ -152,18 +192,19 @@ def load_artifact_index(path: str | Path) -> dict[str, dict[str, str]]:
                 f"artifact refs for {block_id} must be a non-empty object",
             )
         result[block_id] = {}
-        for bit_width, artifact_path in refs.items():
-            if not str(bit_width).isdigit():
+        for ref_key, artifact_path in refs.items():
+            normalized_key = str(ref_key)
+            if not normalized_key or (not normalized_key.isdigit() and "." not in normalized_key):
                 raise RuntimeError(
                     "invalid_artifact_index",
-                    f"artifact bit-width {bit_width!r} for {block_id} is invalid",
+                    f"artifact ref key {ref_key!r} for {block_id} is invalid",
                 )
             if not isinstance(artifact_path, str) or not artifact_path:
                 raise RuntimeError(
                     "invalid_artifact_index",
-                    f"artifact path for {block_id}/{bit_width} must be non-empty",
+                    f"artifact path for {block_id}/{ref_key} must be non-empty",
                 )
-            result[block_id][str(bit_width)] = artifact_path
+            result[block_id][normalized_key] = artifact_path
     return result
 
 
@@ -213,19 +254,48 @@ def _materialize_plan_artifacts(
     records: list[dict[str, Any]] = []
     for block_id, bit_width in plan.decisions.items():
         block = descriptors[block_id]
-        artifact_path = block.artifact_refs[str(bit_width)]
-        if is_tensor_bitplane_artifact_path(artifact_path):
-            artifact = load_tensor_bitplane_artifact(artifact_path)
+        for ref in artifact_paths_for_block(block, bit_width):
+            artifact_path = ref.artifact_path
+            if is_tensor_bitplane_artifact_path(artifact_path):
+                artifact = load_tensor_bitplane_artifact(artifact_path)
+                if artifact.metadata.tensor_name not in block.tensor_names:
+                    raise RuntimeError(
+                        "artifact_tensor_mismatch",
+                        f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
+                    )
+                reconstructed = reconstruct_tensor_weight(
+                    artifact,
+                    bit_width=bit_width,
+                    model_id=config.model,
+                    block_id=block_id,
+                    tensor_name=ref.tensor_name,
+                )
+                records.append(
+                    {
+                        "block_id": block_id,
+                        "bit_width": bit_width,
+                        "artifact_path": str(artifact_path),
+                        "tensor_name": artifact.metadata.tensor_name,
+                        "selected_planes": list(reconstructed.selected_planes),
+                        "shape": list(artifact.metadata.original_shape),
+                        "quantization_scheme": artifact.metadata.quantization.scheme,
+                        "checksum": artifact.metadata.checksum,
+                        "storage_layout": "packed_uint8_bitplanes",
+                    }
+                )
+                continue
+            artifact = load_bitplane_artifact(artifact_path)
             if artifact.metadata.tensor_name not in block.tensor_names:
                 raise RuntimeError(
                     "artifact_tensor_mismatch",
                     f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
                 )
-            reconstructed = reconstruct_tensor_weight(
+            reconstructed = reconstruct_weight(
                 artifact,
                 bit_width=bit_width,
                 model_id=config.model,
                 block_id=block_id,
+                tensor_name=ref.tensor_name,
             )
             records.append(
                 {
@@ -237,32 +307,19 @@ def _materialize_plan_artifacts(
                     "shape": list(artifact.metadata.original_shape),
                     "quantization_scheme": artifact.metadata.quantization.scheme,
                     "checksum": artifact.metadata.checksum,
-                    "storage_layout": "packed_uint8_bitplanes",
                 }
             )
-            continue
-        artifact = load_bitplane_artifact(artifact_path)
-        if artifact.metadata.tensor_name not in block.tensor_names:
-            raise RuntimeError(
-                "artifact_tensor_mismatch",
-                f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
-            )
-        reconstructed = reconstruct_weight(
-            artifact,
-            bit_width=bit_width,
-            model_id=config.model,
-            block_id=block_id,
-        )
-        records.append(
-            {
-                "block_id": block_id,
-                "bit_width": bit_width,
-                "artifact_path": str(artifact_path),
-                "tensor_name": artifact.metadata.tensor_name,
-                "selected_planes": list(reconstructed.selected_planes),
-                "shape": list(artifact.metadata.original_shape),
-                "quantization_scheme": artifact.metadata.quantization.scheme,
-                "checksum": artifact.metadata.checksum,
-            }
-        )
     return tuple(records)
+
+
+def _static_runtime_impl(
+    config: RunConfig,
+    *,
+    adapter: Any,
+    mixed_weight_forward_applied: bool,
+) -> str:
+    if mixed_weight_forward_applied:
+        return "qaq.runtime.static.hf_bitplane_weight_overrides"
+    if config.mode == "fp16" and adapter_supports_weight_overrides(adapter):
+        return "qaq.runtime.static.hf_reference"
+    return "qaq.runtime.static.fake_cpu"

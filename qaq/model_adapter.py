@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from qaq.benchmark_adapter import TokenizedBenchmarkBatch, build_tokenized_batch
 from qaq.config import RunConfig
@@ -133,6 +135,7 @@ class FakeCausalLMAdapter:
     """Small deterministic causal-LM-shaped adapter for local tests."""
 
     feature_source = "block_output_pooled"
+    supports_weight_overrides = False
 
     def __init__(
         self,
@@ -210,7 +213,15 @@ class FakeCausalLMAdapter:
         batch: TokenizedBenchmarkBatch,
         *,
         block_ids: tuple[str, ...] | None = None,
+        weight_overrides: Mapping[str, Any] | None = None,
+        precision_label: str | None = None,
     ) -> ReferenceBatchOutput:
+        if weight_overrides:
+            raise ModelAdapterError(
+                "unsupported_weight_overrides",
+                "fake adapter does not support real weight override inference",
+            )
+        del precision_label
         resolved_block_ids = block_ids or _default_block_ids(self.num_layers)
         logits: list[tuple[float, ...]] = []
         losses: list[float | None] = []
@@ -299,6 +310,7 @@ class HuggingFaceCausalLMAdapter:
     """Hugging Face causal-LM adapter for local Llama-family checkpoints."""
 
     feature_source = "layer_output_pooled_shared_mha_ffn"
+    supports_weight_overrides = True
 
     def __init__(
         self,
@@ -375,19 +387,30 @@ class HuggingFaceCausalLMAdapter:
         batch: TokenizedBenchmarkBatch,
         *,
         block_ids: tuple[str, ...] | None = None,
+        weight_overrides: Mapping[str, Any] | None = None,
+        precision_label: str | None = None,
     ) -> ReferenceBatchOutput:
         torch = _import_torch()
         model = self._ensure_model_loaded()
-        device = next(model.parameters()).device
-        input_ids = torch.tensor(batch.input_ids, dtype=torch.long, device=device)
-        attention_mask = torch.tensor(batch.attention_mask, dtype=torch.long, device=device)
-        with torch.no_grad():
-            output = model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
+        with _temporary_weight_overrides(model, weight_overrides or {}, torch=torch):
+            device = next(model.parameters()).device
+            input_ids = torch.tensor(batch.input_ids, dtype=torch.long, device=device)
+            attention_mask = torch.tensor(batch.attention_mask, dtype=torch.long, device=device)
+            with torch.no_grad():
+                output = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    use_cache=False,
+                )
+            target_losses = _hf_target_language_model_losses(
+                model=model,
+                tokenizer=self.tokenizer,
+                batch=batch,
+                torch=torch,
+                device=device,
             )
+
         active_lengths = [max(sum(row), 1) for row in batch.attention_mask]
         logits: list[tuple[float, ...]] = []
         predictions: list[int] = []
@@ -411,7 +434,7 @@ class HuggingFaceCausalLMAdapter:
         )
         return ReferenceBatchOutput(
             logits=tuple(logits),
-            losses=tuple(None for _ in batch.examples),
+            losses=target_losses,
             predictions=tuple(predictions),
             hidden_states=hidden_states,
             metadata={
@@ -421,8 +444,15 @@ class HuggingFaceCausalLMAdapter:
                 "split": batch.metadata.split,
                 "prompt_format": batch.metadata.prompt_format,
                 "feature_source": self.feature_source,
-                "precision": "hf_reference",
+                "precision": precision_label or "hf_reference",
                 "batch_size": batch.metadata.batch_size,
+                "weight_override_count": len(weight_overrides or {}),
+                "loss_source": (
+                    "hf_target_token_nll"
+                    if any(loss is not None for loss in target_losses)
+                    else "none_no_targets"
+                ),
+                "target_loss_count": sum(loss is not None for loss in target_losses),
             },
         )
 
@@ -456,6 +486,50 @@ class HuggingFaceCausalLMAdapter:
             for name, parameter in model.named_parameters()
         )
         return model
+
+
+@contextmanager
+def _temporary_weight_overrides(
+    model: Any,
+    weight_overrides: Mapping[str, Any],
+    *,
+    torch: Any,
+) -> Iterator[None]:
+    if not weight_overrides:
+        yield
+        return
+
+    named_parameters = dict(model.named_parameters())
+    original_data: dict[str, Any] = {}
+    try:
+        for name, override in weight_overrides.items():
+            parameter = named_parameters.get(name)
+            if parameter is None:
+                raise ModelAdapterError(
+                    "unknown_weight_override",
+                    f"model has no parameter named {name!r}",
+                )
+            if not isinstance(override, torch.Tensor):
+                raise ModelAdapterError(
+                    "invalid_weight_override",
+                    f"weight override {name!r} must be a torch.Tensor",
+                )
+            expected_shape = tuple(int(value) for value in parameter.data.shape)
+            actual_shape = tuple(int(value) for value in override.shape)
+            if actual_shape != expected_shape:
+                raise ModelAdapterError(
+                    "weight_override_shape_mismatch",
+                    f"weight override {name!r} has shape {actual_shape}, expected {expected_shape}",
+                )
+            original_data[name] = parameter.data
+            parameter.data = override.to(
+                device=parameter.data.device,
+                dtype=parameter.data.dtype,
+            ).contiguous()
+        yield
+    finally:
+        for name, data in original_data.items():
+            named_parameters[name].data = data
 
 
 def load_model_adapter(config: RunConfig) -> Any:
@@ -735,6 +809,93 @@ def _target_loss(*, target: str | None, prediction: int) -> float | None:
         return None
     target_score = sum(ord(character) for character in target) % 17
     return round(abs(target_score - prediction) / 17.0, 6)
+
+
+def _hf_target_language_model_losses(
+    *,
+    model: Any,
+    tokenizer: Any,
+    batch: TokenizedBenchmarkBatch,
+    torch: Any,
+    device: Any,
+) -> tuple[float | None, ...]:
+    """Compute target-token NLL for HF reference outputs when targets exist."""
+
+    losses: list[float | None] = [None for _ in batch.examples]
+    target_rows: list[tuple[int, ...]] = []
+    target_lengths: list[int] = []
+    row_indices: list[int] = []
+    prompt_lengths: list[int] = []
+    max_model_length = int(getattr(tokenizer, "model_max_length", 0) or 0)
+
+    for row_index, (input_row, mask_row, target) in enumerate(
+        zip(batch.input_ids, batch.attention_mask, batch.targets, strict=True)
+    ):
+        if target is None:
+            continue
+        prompt_ids = tuple(
+            token for token, mask_value in zip(input_row, mask_row, strict=True) if mask_value
+        )
+        if not prompt_ids:
+            prompt_ids = (int(getattr(tokenizer, "pad_token_id", 0)),)
+        target_ids = _encode_hf_target_tokens(tokenizer, target)
+        if max_model_length > 0 and len(prompt_ids) + len(target_ids) > max_model_length:
+            target_ids = target_ids[: max(max_model_length - len(prompt_ids), 0)]
+        if not target_ids:
+            continue
+        target_rows.append(prompt_ids + target_ids)
+        target_lengths.append(len(target_ids))
+        row_indices.append(row_index)
+        prompt_lengths.append(len(prompt_ids))
+
+    if not target_rows:
+        return tuple(losses)
+
+    pad_token_id = int(getattr(tokenizer, "pad_token_id", 0))
+    padded_length = max(len(row) for row in target_rows)
+    input_ids = torch.tensor(
+        [row + (pad_token_id,) * (padded_length - len(row)) for row in target_rows],
+        dtype=torch.long,
+        device=device,
+    )
+    attention_mask = torch.tensor(
+        [(1,) * len(row) + (0,) * (padded_length - len(row)) for row in target_rows],
+        dtype=torch.long,
+        device=device,
+    )
+    with torch.no_grad():
+        output = model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=False,
+            use_cache=False,
+        )
+    for target_batch_index, original_row_index in enumerate(row_indices):
+        prompt_length = prompt_lengths[target_batch_index]
+        target_length = target_lengths[target_batch_index]
+        start = prompt_length - 1
+        end = prompt_length + target_length - 1
+        target_ids = input_ids[
+            target_batch_index,
+            prompt_length : prompt_length + target_length,
+        ]
+        target_logits = output.logits[target_batch_index, start:end].float()
+        loss = torch.nn.functional.cross_entropy(
+            target_logits,
+            target_ids,
+            reduction="mean",
+        )
+        losses[original_row_index] = float(loss.detach().cpu().item())
+    return tuple(losses)
+
+
+def _encode_hf_target_tokens(tokenizer: Any, target: str) -> tuple[int, ...]:
+    raw_tokenizer = getattr(tokenizer, "_tokenizer", None)
+    if raw_tokenizer is not None and hasattr(raw_tokenizer, "encode"):
+        token_ids = raw_tokenizer.encode(target, add_special_tokens=False)
+        if isinstance(token_ids, list) and all(isinstance(item, int) for item in token_ids):
+            return tuple(token_ids)
+    return tuple(tokenizer.encode(target))
 
 
 def _hidden_feature(

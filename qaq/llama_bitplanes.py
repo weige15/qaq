@@ -187,8 +187,8 @@ def generate_llama_bitplane_artifacts(
     )
     runtime_index_path = _write_runtime_index(
         output_dir,
+        blocks=tuple(selected_blocks),
         records=tuple(records),
-        precision_candidates=precision_candidates,
     )
     manifest_path = _write_generation_manifest(
         output_dir,
@@ -196,6 +196,8 @@ def generate_llama_bitplane_artifacts(
         snapshot=snapshot,
         precision_candidates=precision_candidates,
         max_bit_width=max_bit_width,
+        blocks=tuple(selected_blocks),
+        discovered_block_count=len(blocks),
         block_count=len(selected_blocks),
         tensor_limit_per_block=tensor_limit_per_block,
         max_elements_per_tensor=max_elements_per_tensor,
@@ -574,38 +576,97 @@ def _write_tensor_index(
     *,
     records: tuple[GeneratedArtifactRecord, ...],
 ) -> Path:
-    payload: dict[str, dict[str, str]] = {}
-    for record in records:
-        payload.setdefault(record.block_id, {})[record.tensor_name] = str(
-            record.artifact_path.resolve()
-        )
     path = output_dir / "tensor_artifact_index.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(_tensor_index_payload(records), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return path
 
 
 def _write_runtime_index(
     output_dir: Path,
     *,
+    blocks: tuple[BlockDescriptor, ...],
     records: tuple[GeneratedArtifactRecord, ...],
-    precision_candidates: tuple[int, ...],
 ) -> Path:
-    first_artifact_by_block: dict[str, str] = {}
-    for record in records:
-        first_artifact_by_block.setdefault(
-            record.block_id,
-            str(record.artifact_path.resolve()),
-        )
-    payload = {
-        block_id: {
-            str(bit_width): artifact_path
-            for bit_width in precision_candidates
-        }
-        for block_id, artifact_path in sorted(first_artifact_by_block.items())
-    }
+    coverage = _runtime_index_coverage(blocks, records)
     path = output_dir / "runtime_artifact_index.json"
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(_tensor_index_payload(records), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    if coverage["runtime_index_artifact_ref_mode"] == "missing":
+        raise LlamaBitPlaneGenerationError(
+            "missing_runtime_artifacts",
+            "runtime artifact index did not contain any generated tensor artifacts",
+        )
     return path
+
+
+def _tensor_index_payload(
+    records: tuple[GeneratedArtifactRecord, ...],
+) -> dict[str, dict[str, str]]:
+    payload: dict[str, dict[str, str]] = {}
+    for record in records:
+        payload.setdefault(record.block_id, {})[record.tensor_name] = str(
+            record.artifact_path.resolve()
+        )
+    return payload
+
+
+def _runtime_index_coverage(
+    blocks: tuple[BlockDescriptor, ...],
+    records: tuple[GeneratedArtifactRecord, ...],
+) -> dict[str, Any]:
+    by_block_tensor = {(record.block_id, record.tensor_name): record for record in records}
+    incomplete_blocks: list[dict[str, Any]] = []
+    full_block_count = 0
+    generated_tensor_refs = 0
+    for block in blocks:
+        missing = [
+            tensor_name
+            for tensor_name in block.tensor_names
+            if (block.block_id, tensor_name) not in by_block_tensor
+        ]
+        truncated = [
+            tensor_name
+            for tensor_name in block.tensor_names
+            if (record := by_block_tensor.get((block.block_id, tensor_name))) is not None
+            and record.truncated
+        ]
+        generated = [
+            tensor_name
+            for tensor_name in block.tensor_names
+            if (block.block_id, tensor_name) in by_block_tensor
+        ]
+        generated_tensor_refs += len(generated)
+        if not missing and not truncated:
+            full_block_count += 1
+            continue
+        incomplete_blocks.append(
+            {
+                "block_id": block.block_id,
+                "missing_tensor_names": missing,
+                "truncated_tensor_names": truncated,
+                "generated_tensor_names": generated,
+            }
+        )
+    full_coverage = bool(blocks) and full_block_count == len(blocks)
+    if full_coverage:
+        mode = "full_tensor_index"
+    elif generated_tensor_refs > 0:
+        mode = "partial_tensor_index"
+    else:
+        mode = "missing"
+    return {
+        "runtime_index_format": "block_tensor_artifact_paths",
+        "runtime_index_artifact_ref_mode": mode,
+        "full_tensor_runtime_coverage": full_coverage,
+        "full_runtime_block_count": full_block_count,
+        "selected_block_count": len(blocks),
+        "runtime_index_incomplete_blocks": incomplete_blocks,
+    }
 
 
 def _write_generation_manifest(
@@ -615,6 +676,8 @@ def _write_generation_manifest(
     snapshot: Path,
     precision_candidates: tuple[int, ...],
     max_bit_width: int,
+    blocks: tuple[BlockDescriptor, ...],
+    discovered_block_count: int,
     block_count: int,
     tensor_limit_per_block: int | None,
     max_elements_per_tensor: int | None,
@@ -625,11 +688,17 @@ def _write_generation_manifest(
     runtime_index_path: Path,
 ) -> Path:
     path = output_dir / "generation_manifest.json"
+    runtime_coverage = _runtime_index_coverage(blocks, records)
+    all_discovered_blocks_covered = (
+        bool(runtime_coverage["full_tensor_runtime_coverage"])
+        and block_count == discovered_block_count
+    )
     payload = {
         "model": model,
         "model_snapshot": str(snapshot),
         "precision_candidates": list(precision_candidates),
         "max_bit_width": max_bit_width,
+        "discovered_block_count": discovered_block_count,
         "block_count": block_count,
         "tensor_limit_per_block": tensor_limit_per_block,
         "max_elements_per_tensor": max_elements_per_tensor,
@@ -639,7 +708,10 @@ def _write_generation_manifest(
         "truncated_artifact_count": sum(record.truncated for record in records),
         "tensor_index_path": str(tensor_index_path),
         "runtime_index_path": str(runtime_index_path),
-        "runtime_index_uses_first_tensor_per_block": True,
+        "runtime_index_uses_first_tensor_per_block": False,
+        "all_discovered_blocks_covered": all_discovered_blocks_covered,
+        "accepted_as_full_quantized_inference_artifact": all_discovered_blocks_covered,
+        **runtime_coverage,
         "records": [record.as_dict() for record in records],
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")

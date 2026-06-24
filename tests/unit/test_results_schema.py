@@ -78,6 +78,11 @@ def _artifact(
             "total_bytes_transferred": 128,
             "failures": 0,
         }
+    metadata = (
+        {"runtime_metadata": {"mixed_precision_forward_applied": True}}
+        if mode in {"static_8bit", "static_4bit", "qaq_on_demand_off", "qaq_on_demand_on"}
+        else {}
+    )
     return ResultArtifact(
         schema_version="qaq.result.v1",
         result_id=f"{model}:{dataset}:{split}:{mode}:seed{seed}",
@@ -130,7 +135,7 @@ def _artifact(
         completion_status=completion_status,
         diagnostic=diagnostic,
         constrained=False,
-        metadata={},
+        metadata=metadata,
     )
 
 
@@ -215,6 +220,16 @@ def test_comparison_rejects_missing_qaq_summaries() -> None:
 
     assert validation.state == "invalid"
     assert "missing_loader_summary:qaq_on_demand_on" in validation.reasons
+
+
+def test_comparison_rejects_quantized_results_without_mixed_weight_forward() -> None:
+    artifacts = list(_accepted_matrix())
+    artifacts[1] = replace(artifacts[1], metadata={})
+
+    validation = validate_comparison(tuple(artifacts))
+
+    assert validation.state == "invalid"
+    assert "missing_mixed_weight_forward:static_8bit" in validation.reasons
 
 
 def test_diagnostic_modes_cannot_satisfy_accepted_comparison() -> None:

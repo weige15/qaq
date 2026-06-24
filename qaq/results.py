@@ -456,6 +456,13 @@ def validate_comparison(
     if incomplete:
         reasons.extend(f"incomplete_result:{mode}" for mode in sorted(incomplete))
 
+    for mode in ("static_8bit", "static_4bit", "qaq_on_demand_off", "qaq_on_demand_on"):
+        artifact = by_mode.get(mode)
+        if artifact is None or artifact.diagnostic or artifact.constrained:
+            continue
+        if not _mixed_weight_forward_applied(artifact):
+            reasons.append(f"missing_mixed_weight_forward:{mode}")
+
     for mode in ("qaq_on_demand_off", "qaq_on_demand_on"):
         artifact = by_mode.get(mode)
         if artifact is None:
@@ -603,6 +610,13 @@ def _is_diagnostic_result(config: RunConfig, output: RuntimeOutputBundle) -> boo
             "cpu" in runtime_impl,
         )
     )
+
+
+def _mixed_weight_forward_applied(artifact: ResultArtifact) -> bool:
+    runtime_metadata = artifact.metadata.get("runtime_metadata")
+    if not isinstance(runtime_metadata, dict):
+        return False
+    return runtime_metadata.get("mixed_precision_forward_applied") is True
 
 
 def _optional_dict(value: Any) -> dict[str, Any] | None:

@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -6,7 +7,12 @@ import pytest
 from qaq.benchmark_adapter import build_tokenized_batch
 from qaq.config import RunConfig
 from qaq.data import BenchmarkDataError, load_benchmark_examples
-from qaq.model_adapter import ModelAdapterError, load_model_adapter
+from qaq.model_adapter import (
+    FakeTokenizer,
+    HuggingFaceCausalLMAdapter,
+    ModelAdapterError,
+    load_model_adapter,
+)
 from qaq.blocks import discover_mha_ffn_blocks
 
 
@@ -197,6 +203,95 @@ def test_local_llama_config_metadata_can_be_loaded_without_weights(tmp_path: Pat
         "model.layers.0.mlp.up_proj.weight",
         "model.layers.0.mlp.down_proj.weight",
     )
+
+
+def test_huggingface_adapter_returns_target_token_losses_without_real_checkpoint(
+    tmp_path: Path,
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    class TinyHFOutput:
+        def __init__(self, *, logits: object, hidden_states: object) -> None:
+            self.logits = logits
+            self.hidden_states = hidden_states
+
+    class TinyHFModel(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.anchor = torch.nn.Parameter(torch.zeros(()))
+            self.vocab_size = 256
+            self.hidden_size = 6
+            self.num_layers = 2
+
+        def forward(
+            self,
+            *,
+            input_ids: object,
+            attention_mask: object | None = None,
+            output_hidden_states: bool = False,
+            use_cache: bool = False,
+        ) -> TinyHFOutput:
+            del attention_mask, output_hidden_states, use_cache
+            batch_size, sequence_length = input_ids.shape
+            logits = torch.zeros(
+                (batch_size, sequence_length, self.vocab_size),
+                dtype=torch.float32,
+                device=input_ids.device,
+            )
+            base_hidden = torch.arange(
+                self.hidden_size,
+                dtype=torch.float32,
+                device=input_ids.device,
+            ).view(1, 1, self.hidden_size)
+            hidden_states = tuple(
+                base_hidden.expand(batch_size, sequence_length, self.hidden_size)
+                + float(layer_index)
+                for layer_index in range(self.num_layers + 1)
+            )
+            return TinyHFOutput(logits=logits, hidden_states=hidden_states)
+
+    config = _config(
+        tmp_path,
+        dataset="tests/fixtures/benchmarks/router_training_real.jsonl",
+        split="validation",
+        prompt_format="question_answer_v1",
+    )
+    adapter = HuggingFaceCausalLMAdapter(
+        model_ref="unused-local-test-model",
+        model_id="tiny-llama-test",
+        tokenizer=FakeTokenizer("tiny-hf-tokenizer", model_max_length=256),
+        hf_config=type(
+            "TinyConfig",
+            (),
+            {"num_hidden_layers": 2, "hidden_size": 6, "vocab_size": 256},
+        )(),
+        requested_device="cpu",
+        gpu_ids=(),
+    )
+    adapter._model = TinyHFModel()
+
+    examples = adapter.load_examples(config)
+    batch = adapter.build_batch(config, examples)
+    output = adapter.reference_forward(
+        batch,
+        block_ids=(
+            "layer_000.mha",
+            "layer_000.ffn",
+            "layer_001.mha",
+            "layer_001.ffn",
+        ),
+    )
+
+    assert len(output.losses) == len(examples)
+    assert all(loss is not None and math.isfinite(loss) for loss in output.losses)
+    assert output.metadata["loss_source"] == "hf_target_token_nll"
+    assert output.metadata["target_loss_count"] == len(examples)
+    assert set(output.hidden_states.by_block) == {
+        "layer_000.mha",
+        "layer_000.ffn",
+        "layer_001.mha",
+        "layer_001.ffn",
+    }
 
 
 def test_unavailable_model_and_dataset_fail_clearly(tmp_path: Path) -> None:

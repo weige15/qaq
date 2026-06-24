@@ -190,8 +190,16 @@ def _validate_decisions(
                 "unsupported_block_precision",
                 f"{block_id} does not support {bit_width}-bit precision",
             )
-        if require_artifacts and str(bit_width) not in descriptor.artifact_refs:
+        if (
+            require_artifacts
+            and str(bit_width) not in descriptor.artifact_refs
+            and not _has_full_tensor_artifacts(descriptor)
+        ):
             raise PrecisionPlanError(
                 "missing_artifact",
                 f"{block_id} is missing artifact for {bit_width}-bit precision",
             )
+
+
+def _has_full_tensor_artifacts(descriptor: BlockDescriptor) -> bool:
+    return all(tensor_name in descriptor.artifact_refs for tensor_name in descriptor.tensor_names)

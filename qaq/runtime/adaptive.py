@@ -20,6 +20,14 @@ from qaq.router.checkpoint import load_router_checkpoint
 from qaq.router.policy import route_hidden_states
 from qaq.router.types import RouterPolicyError
 from qaq.runtime.common import LatencyEvent, MemoryEvent, RuntimeError, RuntimeOutputBundle
+from qaq.runtime.weight_overrides import (
+    artifact_paths_for_block,
+    artifact_ref_mode,
+    build_weight_overrides,
+    combine_reference_outputs,
+    runtime_can_apply_weight_overrides,
+    slice_batch,
+)
 from qaq.tensor_bitplanes import (
     TensorBitPlaneError,
     is_tensor_bitplane_artifact_path,
@@ -60,12 +68,12 @@ def run_adaptive_runtime(
     checkpoint = load_router_checkpoint(config.router_checkpoint)
     _validate_checkpoint_runtime_metadata(config, checkpoint)
     block_ids = tuple(block.block_id for block in blocks)
-    raw_output = adapter.reference_forward(batch, block_ids=block_ids)
+    routing_output = adapter.reference_forward(batch, block_ids=block_ids)
 
     try:
         routing = route_hidden_states(
             checkpoint,
-            hidden_states=raw_output.hidden_states,
+            hidden_states=routing_output.hidden_states,
             blocks=blocks,
             model_id=config.model,
             mode=config.mode,
@@ -82,6 +90,22 @@ def run_adaptive_runtime(
         blocks=blocks,
         plans=routing.plans,
     )
+    mixed_weight_forward_applied = False
+    mixed_weight_forward_reason = "not_attempted"
+    weight_override_records: tuple[dict[str, Any], ...] = ()
+    raw_output = routing_output
+    can_apply, reason = runtime_can_apply_weight_overrides(adapter, blocks)
+    mixed_weight_forward_reason = reason
+    if can_apply:
+        raw_output, weight_override_records = _run_adaptive_weight_overridden_forward(
+            config,
+            adapter=adapter,
+            batch=batch,
+            blocks=blocks,
+            block_ids=block_ids,
+            plans=routing.plans,
+        )
+        mixed_weight_forward_applied = True
     elapsed = perf_counter() - start
     peak_gpu_memory_gb = _peak_gpu_memory_gb(config)
     memory_source = _memory_measurement_source(config)
@@ -133,7 +157,15 @@ def run_adaptive_runtime(
         "adaptive_traces": adaptive_traces,
         "loader_summary": loader_summary,
         "loader_events": loader_events,
-        "runtime_impl": _runtime_impl(config),
+        "artifact_ref_mode": artifact_ref_mode(blocks),
+        "mixed_precision_forward_applied": mixed_weight_forward_applied,
+        "mixed_precision_forward_reason": mixed_weight_forward_reason,
+        "weight_override_tensor_count": len(weight_override_records),
+        "weight_override_records": list(weight_override_records),
+        "runtime_impl": _runtime_impl(
+            config,
+            mixed_weight_forward_applied=mixed_weight_forward_applied,
+        ),
     }
     return RuntimeOutputBundle(
         mode=config.mode,
@@ -273,70 +305,72 @@ def _validate_selected_artifacts(
     for plan in plans:
         for block_id, bit_width in plan.decisions.items():
             block = descriptors[block_id]
-            artifact_path = block.artifact_refs.get(str(bit_width))
-            if artifact_path is None:
-                raise RuntimeError(
-                    "missing_artifact",
-                    f"{block_id} is missing artifact for {bit_width}-bit precision",
-                )
-            try:
-                if is_tensor_bitplane_artifact_path(artifact_path):
-                    artifact = load_tensor_bitplane_artifact(artifact_path)
-                    reconstructed = reconstruct_tensor_weight(
-                        artifact,
-                        bit_width=bit_width,
-                        model_id=config.model,
-                        block_id=block_id,
-                    )
-                    selected_planes = reconstructed.selected_planes
-                else:
-                    artifact = load_bitplane_artifact(artifact_path)
-                    selected_planes = selected_msb_planes(
-                        bit_width,
-                        max_bit_width=artifact.metadata.max_bit_width,
-                    )
-            except BitPlaneError as exc:
-                raise RuntimeError(exc.code, exc.message) from exc
-            except TensorBitPlaneError as exc:
-                raise RuntimeError(exc.code, exc.message) from exc
+            for ref in artifact_paths_for_block(block, bit_width):
+                artifact_path = ref.artifact_path
+                try:
+                    if is_tensor_bitplane_artifact_path(artifact_path):
+                        artifact = load_tensor_bitplane_artifact(artifact_path)
+                        reconstructed = reconstruct_tensor_weight(
+                            artifact,
+                            bit_width=bit_width,
+                            model_id=config.model,
+                            block_id=block_id,
+                            tensor_name=ref.tensor_name,
+                        )
+                        selected_planes = reconstructed.selected_planes
+                    else:
+                        artifact = load_bitplane_artifact(artifact_path)
+                        selected_planes = selected_msb_planes(
+                            bit_width,
+                            max_bit_width=artifact.metadata.max_bit_width,
+                        )
+                except BitPlaneError as exc:
+                    raise RuntimeError(exc.code, exc.message) from exc
+                except TensorBitPlaneError as exc:
+                    raise RuntimeError(exc.code, exc.message) from exc
 
-            metadata = artifact.metadata
-            if metadata.model_id != config.model:
-                raise RuntimeError(
-                    "artifact_model_mismatch",
-                    f"{block_id} artifact model {metadata.model_id} does not match {config.model}",
-                )
-            if metadata.block_id != block_id:
-                raise RuntimeError(
-                    "artifact_block_mismatch",
-                    f"{block_id} artifact block metadata is {metadata.block_id}",
-                )
-            if metadata.tensor_name not in block.tensor_names:
-                raise RuntimeError(
-                    "artifact_tensor_mismatch",
-                    f"{block_id} artifact tensor {metadata.tensor_name} is not owned by the block",
-                )
-            if metadata.max_bit_width != config.max_bit_width:
-                raise RuntimeError(
-                    "artifact_max_bit_width_mismatch",
-                    f"{block_id} artifact max_bit_width {metadata.max_bit_width} does not match {config.max_bit_width}",
-                )
-            artifact_granularity = (metadata.compatibility or {}).get("block_granularity")
-            if artifact_granularity and artifact_granularity != config.block_granularity:
-                raise RuntimeError(
-                    "artifact_granularity_mismatch",
-                    f"{block_id} artifact granularity {artifact_granularity} does not match {config.block_granularity}",
-                )
-            missing_planes = [
-                plane_index
-                for plane_index in selected_planes
-                if plane_index not in metadata.available_planes
-            ]
-            if missing_planes:
-                raise RuntimeError(
-                    "missing_plane",
-                    f"{block_id} artifact is missing selected planes {missing_planes}",
-                )
+                metadata = artifact.metadata
+                if metadata.model_id != config.model:
+                    raise RuntimeError(
+                        "artifact_model_mismatch",
+                        f"{block_id} artifact model {metadata.model_id} does not match {config.model}",
+                    )
+                if metadata.block_id != block_id:
+                    raise RuntimeError(
+                        "artifact_block_mismatch",
+                        f"{block_id} artifact block metadata is {metadata.block_id}",
+                    )
+                if metadata.tensor_name not in block.tensor_names:
+                    raise RuntimeError(
+                        "artifact_tensor_mismatch",
+                        f"{block_id} artifact tensor {metadata.tensor_name} is not owned by the block",
+                    )
+                if ref.tensor_name is not None and metadata.tensor_name != ref.tensor_name:
+                    raise RuntimeError(
+                        "artifact_tensor_mismatch",
+                        f"{block_id} artifact index key {ref.tensor_name} points to {metadata.tensor_name}",
+                    )
+                if metadata.max_bit_width != config.max_bit_width:
+                    raise RuntimeError(
+                        "artifact_max_bit_width_mismatch",
+                        f"{block_id} artifact max_bit_width {metadata.max_bit_width} does not match {config.max_bit_width}",
+                    )
+                artifact_granularity = (metadata.compatibility or {}).get("block_granularity")
+                if artifact_granularity and artifact_granularity != config.block_granularity:
+                    raise RuntimeError(
+                        "artifact_granularity_mismatch",
+                        f"{block_id} artifact granularity {artifact_granularity} does not match {config.block_granularity}",
+                    )
+                missing_planes = [
+                    plane_index
+                    for plane_index in selected_planes
+                    if plane_index not in metadata.available_planes
+                ]
+                if missing_planes:
+                    raise RuntimeError(
+                        "missing_plane",
+                        f"{block_id} artifact is missing selected planes {missing_planes}",
+                    )
 
 
 def _materialize_adaptive_plans(
@@ -352,31 +386,33 @@ def _materialize_adaptive_plans(
         for plan in plans:
             for block_id, bit_width in plan.decisions.items():
                 block = descriptors[block_id]
-                artifact_path = Path(block.artifact_refs[str(bit_width)])
-                request = LoaderRequest(
-                    request_id=f"{plan.query_id}:{block_id}:{bit_width}",
-                    query_id=plan.query_id,
-                    block_id=block_id,
-                    bit_width=bit_width,
-                    artifact_path=artifact_path,
-                    target_device=_loader_target_device(config),
-                    model_id=config.model,
-                )
-                try:
-                    materialized = loader.load(request)
-                except LoaderError as exc:
-                    raise RuntimeError(exc.code, exc.message) from exc
-                records.append(
-                    {
-                        "query_id": plan.query_id,
-                        "block_id": block_id,
-                        "bit_width": bit_width,
-                        "artifact_path": str(artifact_path),
-                        "selected_planes": list(materialized.selected_planes),
-                        "loader_request_id": request.request_id,
-                        "bytes_loaded": materialized.bytes_loaded,
-                    }
-                )
+                for ref in artifact_paths_for_block(block, bit_width):
+                    request = LoaderRequest(
+                        request_id=f"{plan.query_id}:{block_id}:{bit_width}:{ref.tensor_name or 'legacy'}",
+                        query_id=plan.query_id,
+                        block_id=block_id,
+                        bit_width=bit_width,
+                        artifact_path=ref.artifact_path,
+                        target_device=_loader_target_device(config),
+                        model_id=config.model,
+                        tensor_name=ref.tensor_name,
+                    )
+                    try:
+                        materialized = loader.load(request)
+                    except LoaderError as exc:
+                        raise RuntimeError(exc.code, exc.message) from exc
+                    records.append(
+                        {
+                            "query_id": plan.query_id,
+                            "block_id": block_id,
+                            "bit_width": bit_width,
+                            "artifact_path": str(ref.artifact_path),
+                            "tensor_name": ref.tensor_name,
+                            "selected_planes": list(materialized.selected_planes),
+                            "loader_request_id": request.request_id,
+                            "bytes_loaded": materialized.bytes_loaded,
+                        }
+                    )
         return (
             tuple(records),
             loader.summary().as_dict(),
@@ -386,19 +422,49 @@ def _materialize_adaptive_plans(
     for plan in plans:
         for block_id, bit_width in plan.decisions.items():
             block = descriptors[block_id]
-            artifact_path = Path(block.artifact_refs[str(bit_width)])
-            if is_tensor_bitplane_artifact_path(artifact_path):
-                artifact = load_tensor_bitplane_artifact(artifact_path)
+            for ref in artifact_paths_for_block(block, bit_width):
+                artifact_path = ref.artifact_path
+                if is_tensor_bitplane_artifact_path(artifact_path):
+                    artifact = load_tensor_bitplane_artifact(artifact_path)
+                    if artifact.metadata.tensor_name not in block.tensor_names:
+                        raise RuntimeError(
+                            "artifact_tensor_mismatch",
+                            f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
+                        )
+                    reconstructed = reconstruct_tensor_weight(
+                        artifact,
+                        bit_width=bit_width,
+                        model_id=config.model,
+                        block_id=block_id,
+                        tensor_name=ref.tensor_name,
+                    )
+                    records.append(
+                        {
+                            "query_id": plan.query_id,
+                            "block_id": block_id,
+                            "bit_width": bit_width,
+                            "artifact_path": str(artifact_path),
+                            "tensor_name": artifact.metadata.tensor_name,
+                            "selected_planes": list(reconstructed.selected_planes),
+                            "shape": list(artifact.metadata.original_shape),
+                            "quantization_scheme": artifact.metadata.quantization.scheme,
+                            "checksum": artifact.metadata.checksum,
+                            "storage_layout": "packed_uint8_bitplanes",
+                        }
+                    )
+                    continue
+                artifact = load_bitplane_artifact(artifact_path)
                 if artifact.metadata.tensor_name not in block.tensor_names:
                     raise RuntimeError(
                         "artifact_tensor_mismatch",
                         f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
                     )
-                reconstructed = reconstruct_tensor_weight(
+                reconstructed = reconstruct_weight(
                     artifact,
                     bit_width=bit_width,
                     model_id=config.model,
                     block_id=block_id,
+                    tensor_name=ref.tensor_name,
                 )
                 records.append(
                     {
@@ -411,34 +477,7 @@ def _materialize_adaptive_plans(
                         "shape": list(artifact.metadata.original_shape),
                         "quantization_scheme": artifact.metadata.quantization.scheme,
                         "checksum": artifact.metadata.checksum,
-                        "storage_layout": "packed_uint8_bitplanes",
                     }
-                )
-                continue
-            artifact = load_bitplane_artifact(artifact_path)
-            if artifact.metadata.tensor_name not in block.tensor_names:
-                raise RuntimeError(
-                    "artifact_tensor_mismatch",
-                    f"{block_id} artifact tensor {artifact.metadata.tensor_name} is not owned by the block",
-                )
-            reconstructed = reconstruct_weight(
-                artifact,
-                bit_width=bit_width,
-                model_id=config.model,
-                block_id=block_id,
-            )
-            records.append(
-                {
-                    "query_id": plan.query_id,
-                    "block_id": block_id,
-                    "bit_width": bit_width,
-                    "artifact_path": str(artifact_path),
-                    "tensor_name": artifact.metadata.tensor_name,
-                    "selected_planes": list(reconstructed.selected_planes),
-                    "shape": list(artifact.metadata.original_shape),
-                    "quantization_scheme": artifact.metadata.quantization.scheme,
-                    "checksum": artifact.metadata.checksum,
-                }
                 )
     return tuple(records), None, ()
 
@@ -457,6 +496,50 @@ def _loader_target_device(config: RunConfig) -> str:
         "invalid_device",
         "adaptive on-demand loading supports only cpu or cuda devices",
     )
+
+
+def _run_adaptive_weight_overridden_forward(
+    config: RunConfig,
+    *,
+    adapter: Any,
+    batch: Any,
+    blocks: tuple[BlockDescriptor, ...],
+    block_ids: tuple[str, ...],
+    plans: tuple[PrecisionPlan, ...],
+) -> tuple[Any, tuple[dict[str, Any], ...]]:
+    outputs = []
+    all_override_records: list[dict[str, Any]] = []
+    per_query_counts: dict[str, int] = {}
+    for query_index, plan in enumerate(plans):
+        query_batch = slice_batch(batch, query_index)
+        weight_overrides, override_records = build_weight_overrides(
+            config,
+            blocks=blocks,
+            plan=plan,
+        )
+        query_id = plan.query_id or query_batch.example_ids[0]
+        for record in override_records:
+            all_override_records.append({"query_id": query_id, **record})
+        per_query_counts[query_id] = len(weight_overrides)
+        outputs.append(
+            adapter.reference_forward(
+                query_batch,
+                block_ids=block_ids,
+                weight_overrides=weight_overrides,
+                precision_label="qaq_selected_bitplane_weight_overrides",
+            )
+        )
+    combined = combine_reference_outputs(
+        tuple(outputs),
+        batch=batch,
+        precision_label="qaq_selected_bitplane_weight_overrides",
+        metadata_updates={
+            "mixed_precision_forward_applied": True,
+            "execution_granularity": "per_query",
+            "per_query_weight_override_counts": per_query_counts,
+        },
+    )
+    return combined, tuple(all_override_records)
 
 
 def _build_adaptive_traces(
@@ -512,7 +595,11 @@ def _build_adaptive_traces(
     return traces
 
 
-def _runtime_impl(config: RunConfig) -> str:
+def _runtime_impl(config: RunConfig, *, mixed_weight_forward_applied: bool) -> str:
+    if mixed_weight_forward_applied:
+        if config.mode == "qaq_on_demand_on":
+            return "qaq.runtime.adaptive.hf_per_query_bitplane_weight_overrides_with_loader"
+        return "qaq.runtime.adaptive.hf_per_query_bitplane_weight_overrides"
     if config.mode == "qaq_on_demand_on" and config.device == "cuda":
         return "qaq.runtime.adaptive.cuda_loader"
     if config.device == "cuda":
