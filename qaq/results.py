@@ -813,7 +813,6 @@ def _is_diagnostic_result(config: RunConfig, output: RuntimeOutputBundle) -> boo
             isinstance(routing_summary, dict) and routing_summary.get("diagnostic") is True,
             config.model.startswith(("fake-", "fake_")),
             config.device == "cpu",
-            output.metadata.get("subset_run") is True,
             "fake" in runtime_impl,
             "cpu" in runtime_impl,
         )
@@ -899,8 +898,8 @@ def _contract_rejection_reasons(
         metadata=metadata,
     ):
         reasons.append("smoke_fixture_or_synthetic_data")
-    if _is_subset_debug_run(metadata):
-        reasons.append("subset_debug_run")
+    if _is_benchmark_subset_run(metadata):
+        reasons.append("benchmark_subset_not_full_acceptance")
     if mode == "fixed_mixed":
         reasons.append("fixed_mixed_diagnostic_mode")
     if mode in MIXED_PRECISION_REQUIRED_MODES:
@@ -921,7 +920,6 @@ def _evidence_level_for_rejections(reasons: Sequence[str]) -> str:
         "fake_dataset",
         "fake_model",
         "smoke_fixture_or_synthetic_data",
-        "subset_debug_run",
         "fixed_mixed_diagnostic_mode",
     }
     if any(reason in diagnostic_reasons for reason in reasons):
@@ -1005,7 +1003,7 @@ def _is_fake_model(model: str) -> bool:
     ) or "tests/fixtures" in str(path)
 
 
-def _is_subset_debug_run(metadata: Mapping[str, Any]) -> bool:
+def _is_benchmark_subset_run(metadata: Mapping[str, Any]) -> bool:
     runtime_metadata = metadata.get("runtime_metadata")
     raw_output_metadata = metadata.get("raw_output_metadata")
     for value in (runtime_metadata, raw_output_metadata):
@@ -1025,28 +1023,46 @@ def _uses_smoke_fixture_or_synthetic_data(
     artifact_scope: str,
     metadata: Mapping[str, Any],
 ) -> bool:
-    haystack = " ".join(
-        (
-            benchmark_name,
-            benchmark_split,
-            artifact_scope,
-            json.dumps(metadata, sort_keys=True, default=str),
-        )
-    ).lower()
-    return any(
-        token in haystack
-        for token in (
-            "fake_smoke",
-            "health_check",
-            "diagnostic_training",
-            "router_health_check",
-            "fixture",
-            "tiny",
-            "synthetic",
-            "sampled_weight_values",
-            "truncated",
-        )
+    return _contains_rejected_evidence_value(
+        {
+            "benchmark_name": benchmark_name,
+            "benchmark_split": benchmark_split,
+            "artifact_scope": artifact_scope,
+            "metadata": dict(metadata),
+        }
     )
+
+
+def _contains_rejected_evidence_value(value: Any) -> bool:
+    rejected_string_tokens = (
+        "fake_smoke",
+        "health_check",
+        "fixture",
+        "tiny",
+        "synthetic",
+        "sampled_weight_values",
+        "truncated",
+    )
+    rejected_true_flags = {
+        "diagnostic_training",
+        "router_health_check",
+        "fixture_only_data",
+    }
+    if isinstance(value, str):
+        lowered = value.lower()
+        return any(token in lowered for token in rejected_string_tokens)
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if key in rejected_true_flags and item is True:
+                return True
+            if key == "truncated_examples" and bool(item):
+                return True
+            if _contains_rejected_evidence_value(item):
+                return True
+        return False
+    if isinstance(value, Sequence) and not isinstance(value, bytes | bytearray):
+        return any(_contains_rejected_evidence_value(item) for item in value)
+    return False
 
 
 def _is_large_model_experiment(*, model: str, gpu_ids: tuple[int, ...]) -> bool:

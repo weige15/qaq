@@ -113,6 +113,13 @@ python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.llama_bi
 python scripts/gpu_run.py --count 1 --min-free-mb 18000 -- python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml
 ```
 
+- Verified real LLaMA-3.1-8B HellaSwag FP16 subset evaluation command. Evidence: `configs/benchmarks/llama_first_milestone/hellaswag/fp16.json`, `qaq/evaluate.py`, `qaq/results.py`, and `scripts/gpu_run.py`. This is real-path subset evidence and is rejected for full QAQ acceptance with `benchmark_subset_not_full_acceptance` until the full comparable five-mode matrix exists:
+
+```bash
+# cwd: /nfs/home/s314511048/qaq
+python scripts/gpu_run.py --count 1 --min-free-mb 18000 --status-file runs/llama_first_milestone/hellaswag/fp16_subset/gpu_run_status.json -- python -m qaq.evaluate --config configs/benchmarks/llama_first_milestone/hellaswag/fp16.json --skip-output-dir-check --max-examples 128 --eval-batch-size 1 --hf-device-map single --result-output runs/llama_first_milestone/hellaswag/fp16_subset/result.json --print-result-json
+```
+
 - Warning: training, full inference, full evaluation, benchmarks, and large-model-loading commands are GPU-dependent and must run through `scripts/gpu_run.py` on the lab RTX 3090 server. Evidence: `AGENTS.md` ML Runtime Policy.
 - Warning: the LLaMA sampled-artifact router training command is documented to fail on the visible local 6 GiB RTX 4050 because it needs at least 15.46 GiB free before activations. Evidence: `doc/router-training.md` and `doc/residual-risk.md`.
 

@@ -185,7 +185,7 @@ def test_max_examples_marks_subset_run_and_rejects_full_acceptance(tmp_path: Pat
     assert output.metadata["max_examples"] == 1
     assert output.metadata["subset_run"] is True
     assert artifact.accepted_as_qaq_result is False
-    assert "subset_debug_run" in artifact.rejection_reasons
+    assert "benchmark_subset_not_full_acceptance" in artifact.rejection_reasons
 
 
 def test_evaluate_cli_records_streaming_overrides(

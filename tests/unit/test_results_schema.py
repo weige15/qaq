@@ -154,6 +154,12 @@ def _artifact(
         )
     ):
         rejection_reasons.append("smoke_fixture_or_synthetic_data")
+    for value in (metadata.get("runtime_metadata"), metadata.get("raw_output_metadata")):
+        if isinstance(value, dict) and (
+            value.get("subset_run") is True or value.get("max_examples") is not None
+        ):
+            rejection_reasons.append("benchmark_subset_not_full_acceptance")
+            break
     if mode in {"static_8bit", "static_4bit", "qaq_on_demand_off", "qaq_on_demand_on"}:
         if not mixed_precision_forward_applied:
             rejection_reasons.append("mixed_precision_forward_not_applied")
@@ -268,6 +274,32 @@ def test_runtime_output_builds_valid_result_artifact(tmp_path: Path) -> None:
     assert payload["evidence_level"] == "diagnostic_health_check"
     assert payload["accepted_as_qaq_result"] is False
     assert "fake_dataset" in payload["rejection_reasons"]
+
+
+def test_real_benchmark_subset_is_non_diagnostic_but_not_full_acceptance() -> None:
+    artifact = _artifact(
+        "fp16",
+        metadata={
+            "runtime_metadata": {
+                "artifact_ref_mode": "none",
+                "mixed_precision_forward_applied": False,
+                "max_examples": 128,
+                "subset_run": True,
+            },
+            "raw_output_metadata": {
+                "max_examples": 128,
+                "subset_run": True,
+            },
+        },
+    )
+
+    validate_result_artifact(artifact)
+
+    assert artifact.diagnostic is False
+    assert artifact.evidence_level == "real_path_implemented"
+    assert artifact.accepted_as_qaq_result is False
+    assert "benchmark_subset_not_full_acceptance" in artifact.rejection_reasons
+    assert "diagnostic_result" not in artifact.rejection_reasons
 
 
 def test_result_artifact_roundtrip_is_deterministic_json(tmp_path: Path) -> None:
