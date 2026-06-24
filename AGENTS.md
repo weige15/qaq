@@ -1,4 +1,33 @@
 # Agent Instructions
+## Evidence Ladder for ML Work
+
+This repository has four evidence levels:
+
+1. **Diagnostic fake path**
+
+   * Uses `fake_smoke`, fake tokenizer/model identifiers, mocked models, synthetic tensors, or fixture-only data.
+   * Purpose: validate plumbing, schemas, logging, CLI behavior, and failure paths.
+   * Never accepted as implementation completion for ML, router, quantization, runtime, or benchmark claims.
+
+2. **Tiny real-mechanism path**
+
+   * Uses tiny local models, tiny Hugging Face-shaped modules, or tiny file-backed samples.
+   * Purpose: prove the mechanism is wired to real code paths.
+   * Valid only as implementation evidence, not benchmark evidence.
+
+3. **Real-subset path**
+
+   * Uses a real local Hugging Face checkpoint or real benchmark subset with the same objective, tokenizer, prompt format, artifact format, and metric as the intended full run.
+   * Must record reproducible commands, selected GPU IDs when GPU is used, input dataset path, output artifact path, and non-fake metadata.
+   * This is the minimum level required before marking an ML feature complete.
+
+4. **Accepted benchmark path**
+
+   * Uses the required model, tokenizer, benchmark split, prompt format, precision candidates, result artifact schema, and comparison modes.
+   * Must pass the acceptance contract and produce a comparable result matrix.
+   * This is required before making paper-scale claims.
+
+When implementing ML features, do not stop at level 1. If full paper-scale work is too expensive, implement level 3, not another level-1 diagnostic path.
 
 ## Repository Context
 
@@ -16,9 +45,16 @@ research intent. Start with:
 - `doc/test-plan.md`
 - `doc/tasks/progress.md`
 
-Current code is intentionally dependency-free and mostly exercises fake/local
-model adapters, small tensors, and CPU simulation. Do not describe these paths
-as paper-scale QAQ evidence.
+Current code contains diagnostic fake/local paths for fast regression tests, but new ML feature work must not expand fake-only behavior unless the task explicitly says "diagnostic only".
+
+Fake paths may be preserved for tests, but implementation work must prefer the smallest real mechanism that can run under repository policy:
+
+* local CPU tests for pure contracts;
+* tiny Hugging Face-shaped tests for mechanism coverage;
+* real local Hugging Face checkpoint paths when optional dependencies are installed;
+* lab RTX 3090 GPU runs through `scripts/gpu_run.py` for large-model loading, benchmark execution, training, or memory measurements.
+
+Do not describe fake, mocked, synthetic, or tiny fixture evidence as completion for model adaptation, router training, quantized inference, dynamic loading, or benchmark reproduction.
 
 ## Current Implementation Status
 
@@ -204,3 +240,14 @@ Experiment reports must include:
 - dataset path
 - output path
 - metric / score
+
+## Fake Path Containment Rule
+
+When a task asks for real model, real benchmark, real quantization, real router, real runtime, or real evaluation work:
+
+* Do not spend the pass improving `fake_smoke`, fake tokenizers, fake models, mocked adapters, or synthetic-only tests unless they are broken by the real implementation.
+* Do not add new fake identifiers, fake datasets, fake result rows, or mocked model behavior as the main deliverable.
+* Do not mark a task complete because fake/tiny tests pass.
+* Do not silently fall back from a real model, real tokenizer, real dataset, CUDA, or artifact failure to fake behavior.
+* If the real path cannot run in the current environment, implement the real code path, add preflight validation, and output the exact lab-server command required to verify it.
+* Documentation updates must classify evidence as diagnostic, tiny-mechanism, real-subset, or accepted benchmark evidence.

@@ -284,11 +284,20 @@ class FakeCausalLMAdapter:
             predictions=tuple(predictions),
             hidden_states=hidden_states,
             metadata={
+                **_adapter_provenance_metadata(
+                    model_id=self.model_id,
+                    tokenizer=self.tokenizer,
+                    batch=batch,
+                    adapter_kind="fake_adapter",
+                    selected_gpu_ids=(),
+                    model_source="fake_adapter",
+                ),
                 "model": self.model_id,
                 "tokenizer": self.tokenizer.tokenizer_id,
                 "dataset": batch.metadata.dataset,
                 "split": batch.metadata.split,
                 "prompt_format": batch.metadata.prompt_format,
+                "context_length_policy": batch.metadata.context_length_policy,
                 "feature_source": self.feature_source,
                 "precision": "fp16_reference",
                 "batch_size": batch.metadata.batch_size,
@@ -351,6 +360,7 @@ class HuggingFaceCausalLMAdapter:
         self.gpu_ids = gpu_ids
         self.hf_device_map = hf_device_map
         self.hf_max_memory_per_gpu = hf_max_memory_per_gpu
+        self._model_loaded_from_pretrained = False
         self.num_layers = _coerce_positive_int(
             getattr(hf_config, "num_hidden_layers", None),
             field="num_hidden_layers",
@@ -484,11 +494,24 @@ class HuggingFaceCausalLMAdapter:
             predictions=tuple(predictions),
             hidden_states=hidden_states,
             metadata={
+                **_adapter_provenance_metadata(
+                    model_id=self.model_id,
+                    tokenizer=self.tokenizer,
+                    batch=batch,
+                    adapter_kind="huggingface_llama",
+                    selected_gpu_ids=self.gpu_ids,
+                    model_source=(
+                        "huggingface_local_pretrained"
+                        if self._model_loaded_from_pretrained
+                        else "injected_model_object"
+                    ),
+                ),
                 "model": self.model_id,
                 "tokenizer": self.tokenizer.tokenizer_id,
                 "dataset": batch.metadata.dataset,
                 "split": batch.metadata.split,
                 "prompt_format": batch.metadata.prompt_format,
+                "context_length_policy": batch.metadata.context_length_policy,
                 "feature_source": self.feature_source,
                 "precision": precision_label or "hf_reference",
                 "batch_size": batch.metadata.batch_size,
@@ -574,6 +597,7 @@ class HuggingFaceCausalLMAdapter:
             model.to(target_device)
         model.eval()
         self._model = model
+        self._model_loaded_from_pretrained = True
         self._parameter_views = tuple(
             HuggingFaceParameterView(name=name, parameter=parameter)
             for name, parameter in model.named_parameters()
@@ -897,6 +921,77 @@ def _deterministic_logits(
         round(((token_sum + (index + 1) * active_length) % 997) / 997.0, 6)
         for index in range(vocab_size)
     )
+
+
+def _adapter_provenance_metadata(
+    *,
+    model_id: str,
+    tokenizer: Any,
+    batch: TokenizedBenchmarkBatch,
+    adapter_kind: str,
+    selected_gpu_ids: tuple[int, ...],
+    model_source: str,
+) -> dict[str, Any]:
+    sources = tuple(
+        str(example.metadata.get("source"))
+        for example in batch.examples
+        if example.metadata.get("source") is not None
+    )
+    dataset_is_fake = _dataset_is_fake(batch.metadata.dataset)
+    tokenizer_id = str(getattr(tokenizer, "tokenizer_id", ""))
+    tokenizer_is_fake = _tokenizer_is_fake(tokenizer)
+    fixture_only = _fixture_only_dataset(batch.metadata.dataset, sources)
+    model_is_fake = (
+        _is_fake_identifier(model_id)
+        or adapter_kind == "fake_adapter"
+        or model_source == "injected_model_object"
+    )
+    benchmark_is_real = all(
+        bool(example.metadata.get("real_benchmark"))
+        for example in batch.examples
+    )
+    diagnostic = model_is_fake or tokenizer_is_fake or dataset_is_fake or fixture_only
+    return {
+        "adapter_kind": adapter_kind,
+        "model_source": model_source,
+        "model_is_fake": model_is_fake,
+        "tokenizer_is_fake": tokenizer_is_fake,
+        "dataset_is_fake": dataset_is_fake,
+        "fixture_only_data": fixture_only,
+        "benchmark_is_real": benchmark_is_real,
+        "diagnostic": diagnostic,
+        "selected_gpu_ids": list(selected_gpu_ids),
+        "dataset_sources": list(dict.fromkeys(sources)),
+        "tokenizer_class": type(tokenizer).__name__,
+        "tokenizer_id": tokenizer_id,
+    }
+
+
+def _dataset_is_fake(dataset: str) -> bool:
+    lowered = dataset.lower()
+    return (
+        dataset in _BUILTIN_DATASETS_FOR_PROVENANCE
+        or "fake" in lowered
+        or "smoke" in lowered
+    )
+
+
+def _tokenizer_is_fake(tokenizer: Any) -> bool:
+    tokenizer_id = str(getattr(tokenizer, "tokenizer_id", ""))
+    return isinstance(tokenizer, FakeTokenizer) or _is_fake_identifier(tokenizer_id)
+
+
+def _fixture_only_dataset(dataset: str, sources: tuple[str, ...]) -> bool:
+    values = (dataset, *sources)
+    return any(
+        value == "fixture"
+        or "tests/fixtures" in value
+        or "tests\\fixtures" in value
+        for value in values
+    )
+
+
+_BUILTIN_DATASETS_FOR_PROVENANCE = frozenset({"fake_smoke", "toy_prompts"})
 
 
 def _target_loss(*, target: str | None, prediction: int) -> float | None:

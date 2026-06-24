@@ -73,3 +73,17 @@ A paper-like QAQ comparison is accepted only when all five modes are present:
 All five must share the same model, tokenizer, benchmark, split, prompt format, metric, precision candidates, seed, and block granularity. QAQ modes must include routing summaries. `qaq_on_demand_on` must include loader summary and loader activity. Every artifact in the comparison must have `accepted_as_qaq_result: true`.
 
 If any condition is missing, `qaq.report` must return `invalid` or `diagnostic` with explicit rejection reasons instead of comparing silently.
+
+## Evidence Rejection Rules
+
+A result artifact must be rejected as accepted evidence if any of the following are true:
+
+- `diagnostic == true`
+- `fake == true`
+- dataset is `fake_smoke`
+- model id starts with `fake-` or `fake_`
+- tokenizer id starts with `fake-` or `fake_`
+- model source is mocked, synthetic, TinyHFModel, or fixture-only
+- `mixed_precision_forward_applied != true` for quantized or QAQ modes
+- `artifact_ref_mode != full_tensor_index` for accepted quantized runtime evidence
+- selected physical GPU IDs are missing for GPU-required runs

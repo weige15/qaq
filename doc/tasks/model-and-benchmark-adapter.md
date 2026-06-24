@@ -30,7 +30,10 @@ Experiment Configuration and Run Manifest. Coordinate model metadata with Block 
 - [x] Expose FP16/reference execution outputs needed by static baselines, router training, and evaluation metrics.
 - [x] Expose hidden representations at a documented feature point for each controlled block.
 - [x] Provide model architecture metadata to the Block Registry without leaking framework-specific details into downstream modules.
-- [x] Add fake-model or tiny-model adapter tests that do not require LLaMA-3.1-8B or GPU access.
+- [x] Preserve fake/tiny adapter tests as diagnostic regression coverage only.
+- [ ] Add real local Hugging Face LLaMA adapter verification.
+- [ ] Add real-subset benchmark/tokenization verification using non-fake data.
+- [ ] Add lab-server GPU verification command for large checkpoint loading.
 
 ## Tests and Quality Gates
 
@@ -40,6 +43,9 @@ Experiment Configuration and Run Manifest. Coordinate model metadata with Block 
 
 ## Done When
 
-- [x] The adapter can run a fake or tiny model reference pass and return logits/losses plus hidden features.
-- [x] Benchmark examples are tokenized consistently across modes.
-- [x] Adapter smoke tests pass without requiring full paper-scale checkpoints.
+- [x] Diagnostic fake adapter tests still pass, and adapter output now marks them diagnostic-only.
+- [ ] A real local Hugging Face LLaMA-family adapter path exists and fails clearly when dependencies, local files, tokenizer, model config, or CUDA are unavailable.
+- [ ] The adapter can resolve a local cached `meta-llama/Llama-3.1-8B` snapshot without network access.
+- [x] The adapter records model id, tokenizer id, dataset, split, prompt format, context policy, selected GPU IDs when applicable, benchmark/data provenance, and whether the run is fake/diagnostic.
+- [ ] At least one non-fake local or lab-server verification command is documented.
+- [x] The task is not marked complete from `fake_smoke`, `TinyHFModel`, mocked model objects, synthetic tensors, or fixture-only tests.

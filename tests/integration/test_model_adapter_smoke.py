@@ -71,6 +71,16 @@ def test_fake_adapter_reference_pass_returns_outputs_and_hidden_features(tmp_pat
     assert len(output.losses) == len(examples)
     assert output.metadata["precision"] == "fp16_reference"
     assert output.metadata["feature_source"] == "block_output_pooled"
+    assert output.metadata["adapter_kind"] == "fake_adapter"
+    assert output.metadata["model_source"] == "fake_adapter"
+    assert output.metadata["model_is_fake"] is True
+    assert output.metadata["tokenizer_is_fake"] is True
+    assert output.metadata["dataset_is_fake"] is True
+    assert output.metadata["fixture_only_data"] is False
+    assert output.metadata["benchmark_is_real"] is False
+    assert output.metadata["diagnostic"] is True
+    assert output.metadata["context_length_policy"] == "truncate"
+    assert output.metadata["selected_gpu_ids"] == []
     assert set(output.hidden_states.by_block) == {block.block_id for block in blocks}
     assert all(len(vectors) == len(examples) for vectors in output.hidden_states.by_block.values())
     assert all(
@@ -155,6 +165,14 @@ def test_named_real_benchmark_resolves_from_local_root(
     assert examples[0].metadata["benchmark_name"] == "hellaswag"
     assert "Choices:" in examples[0].text
     assert batch.metadata.prompt_format == "lm_eval:hellaswag"
+
+    output = adapter.reference_forward(batch)
+
+    assert output.metadata["dataset_is_fake"] is False
+    assert output.metadata["benchmark_is_real"] is True
+    assert output.metadata["fixture_only_data"] is False
+    assert output.metadata["dataset_sources"] == [str(hellaswag_dir / "validation.jsonl")]
+    assert output.metadata["diagnostic"] is True
 
 
 def test_named_real_benchmark_without_local_or_cached_data_fails_actionably(
@@ -348,6 +366,14 @@ def test_huggingface_adapter_returns_target_token_losses_without_real_checkpoint
     assert all(loss is not None and math.isfinite(loss) for loss in output.losses)
     assert output.metadata["loss_source"] == "hf_target_token_nll"
     assert output.metadata["target_loss_count"] == len(examples)
+    assert output.metadata["adapter_kind"] == "huggingface_llama"
+    assert output.metadata["model_source"] == "injected_model_object"
+    assert output.metadata["model_is_fake"] is True
+    assert output.metadata["tokenizer_is_fake"] is True
+    assert output.metadata["dataset_is_fake"] is False
+    assert output.metadata["fixture_only_data"] is True
+    assert output.metadata["diagnostic"] is True
+    assert output.metadata["selected_gpu_ids"] == []
     assert set(output.hidden_states.by_block) == {
         "layer_000.mha",
         "layer_000.ffn",

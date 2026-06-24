@@ -9,9 +9,12 @@
 
 - [x] Experiment Configuration and Run Manifest (`doc/tasks/experiment-configuration-and-run-manifest.md`)
   - 2026-06-23T18:13:18+08:00: Implemented and verified config validation, manifest lifecycle updates, JSON/TOML config loading, `use_model_tokenizer` fallback, and `python -m qaq.config` validation.
-- [x] Model and Benchmark Adapter (`doc/tasks/model-and-benchmark-adapter.md`)
-  - 2026-06-23T18:25:05+08:00: Implemented dependency-free fake/local model and benchmark adapter path with recorded tokenization metadata, deterministic FP16/reference outputs, block-keyed hidden features, architecture metadata compatible with block discovery, fixture-backed benchmark loading, and clear unsupported model/dataset failures. Verified with `python -m pytest -q tests/integration/test_model_adapter_smoke.py` and `python -m pytest -q`. Real LLaMA/Hugging Face loading remains intentionally unimplemented until an external model-loading dependency is approved.
-  - 2026-06-24T13:49:10+08:00: Added target-token negative log-likelihood losses for the Hugging Face reference adapter when file-backed benchmark examples provide targets. This unblocks result-artifact metric aggregation for the sampled LLaMA checkpoint evaluation path without changing the acceptance status of sampled artifacts or fixture metrics. Verified with `python -m pytest -q tests/integration/test_model_adapter_smoke.py`, the GPU-wrapped LLaMA checkpoint evaluation command, and `python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m pytest -q`.
+- [ ] Model and Benchmark Adapter (`doc/tasks/model-and-benchmark-adapter.md`)
+  - Diagnostic fake/local adapter path exists and remains useful for regression coverage.
+  - Optional Hugging Face/LLaMA metadata and reference-forward support exists, but accepted evidence is not complete.
+  - Do not treat this module as done until a real local LLaMA adapter verification and real-subset benchmark/tokenization verification are recorded.
+  - Fake/tiny tests are diagnostic-only and cannot close this task.
+  - 2026-06-25T04:05:18+08:00: Added adapter-level provenance metadata to reference outputs: adapter kind, model source, fake model/tokenizer flags, fake dataset flag, fixture-only flag, real-benchmark flag, diagnostic flag, selected GPU IDs, dataset sources, and context-length policy. Tests now prove fake-smoke outputs remain diagnostic, local-root HellaSwag rows are recognized as real benchmark data while still diagnostic under a fake model, and injected TinyHF/mocked Hugging Face objects cannot satisfy real-adapter evidence. Verified with `python -m py_compile qaq/model_adapter.py tests/integration/test_model_adapter_smoke.py`, `python -m pytest -q tests/integration/test_model_adapter_smoke.py`, `python -m pytest -q tests/integration/test_static_equivalent_profiles.py`, and `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py`. Real local LLaMA snapshot verification and lab-server GPU loading remain incomplete.
 - [x] Block Registry and Precision Plan (`doc/tasks/block-registry-and-precision-plan.md`)
   - 2026-06-23T18:20:27+08:00: Implemented fake-transformer MHA/FFN block discovery, stable block descriptors, static/fixed/QAQ precision-plan validation, artifact availability checks, and block registry tests. Verified with `python -m pytest -q tests/unit/test_block_registry.py` and `python -m pytest -q`.
 - [x] Quantization and Bit-Plane Store (`doc/tasks/quantization-and-bit-plane-store.md`)
@@ -313,3 +316,15 @@
 - Evidence: adaptive streaming smoke coverage passed with `python -m pytest -q tests/integration/test_mixed_weight_runtime.py tests/e2e/test_smoke_modes.py` (`6 passed`).
 - Evidence: requested local verification passed with `python -m pytest -q tests/unit tests/integration` (`131 passed`).
 - Remaining limitation: no real HellaSwag benchmark, large-model load, GPU memory benchmark, or full FP16/static/QAQ comparison was run locally. Real evidence still requires lab RTX 3090 execution through `scripts/gpu_run.py`.
+
+### 2026-06-25T04:05:18+08:00
+
+- Continued the Model and Benchmark Adapter workstream only.
+- Updated `qaq/model_adapter.py` so both fake and Hugging Face reference outputs carry explicit adapter provenance: adapter kind, model source, fake model/tokenizer flags, fake dataset flag, fixture-only flag, real-benchmark flag, diagnostic flag, selected GPU IDs, dataset sources, and context-length policy.
+- Updated `tests/integration/test_model_adapter_smoke.py` to assert fake-smoke outputs remain diagnostic-only, HellaSwag rows loaded from a local benchmark root are recognized as real benchmark data, and injected TinyHF/mocked Hugging Face objects are labeled diagnostic rather than accepted real-adapter evidence.
+- Updated `doc/tasks/model-and-benchmark-adapter.md` done conditions only for the metadata/provenance items actually verified. The module remains incomplete.
+- Evidence: `python -m py_compile qaq/model_adapter.py tests/integration/test_model_adapter_smoke.py` passed.
+- Evidence: `python -m pytest -q tests/integration/test_model_adapter_smoke.py` passed with 9 tests.
+- Evidence: `python -m pytest -q tests/integration/test_static_equivalent_profiles.py` passed with 9 tests.
+- Evidence: `python -m pytest -q tests/unit/test_config_validation.py tests/integration/test_model_adapter_smoke.py tests/integration/test_static_equivalent_profiles.py` passed with 48 tests.
+- Remaining limitation: no real local `meta-llama/Llama-3.1-8B` snapshot verification, large checkpoint load, real GPU execution, or accepted benchmark artifact was run in this pass. Those remain lab-server tasks through `scripts/gpu_run.py`.
