@@ -21,6 +21,7 @@ overwrite: true
 prompt_format: lm_eval:hellaswag
 training_data_limit: 128
 validation_data_limit: 32
+reference_batch_size: 1
 checkpoint_interval_steps: 1
 diagnostic: false
 router:

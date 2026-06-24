@@ -27,7 +27,7 @@ This repository has four evidence levels:
    * Must pass the acceptance contract and produce a comparable result matrix.
    * This is required before making paper-scale claims.
 
-When implementing ML features, do not stop at level 1. If full paper-scale work is too expensive, implement level 3, not another level-1 diagnostic path.
+When implementing ML features, do not stop at level 1. If full paper-scale work is too expensive, implement level 3, not another level-1 diagnostic path. TinyHF-style modules, mocked Hugging Face objects, synthetic tensors, and fixture-only runs may prove wiring, but they cannot close model adapter, router, runtime, quantization, evaluation, or benchmark tasks that require real ML behavior.
 
 ## Repository Context
 

@@ -141,6 +141,7 @@ class RouterTrainingConfig:
     prompt_format: str | None = None
     training_data_limit: int = 2
     validation_data_limit: int = 2
+    reference_batch_size: int = 1
     checkpoint_interval_steps: int = 1
     checkpoint_dir: Path | None = None
     logging: LoggingConfig = LoggingConfig()
@@ -230,6 +231,10 @@ class RouterTrainingConfig:
                 data.get("validation_data_limit", data.get("training_data_limit", 2)),
                 field="validation_data_limit",
             ),
+            reference_batch_size=_coerce_positive_int(
+                data.get("reference_batch_size", 1),
+                field="reference_batch_size",
+            ),
             checkpoint_interval_steps=_coerce_positive_int(
                 checkpoint_interval,
                 field="checkpoint_interval_steps",
@@ -269,6 +274,7 @@ class RouterTrainingConfig:
             "prompt_format": self.prompt_format,
             "training_data_limit": self.training_data_limit,
             "validation_data_limit": self.validation_data_limit,
+            "reference_batch_size": self.reference_batch_size,
             "checkpoint_interval_steps": self.checkpoint_interval_steps,
             "checkpoint_dir": str(self.checkpoint_dir) if self.checkpoint_dir else None,
             "logging": self.logging.as_dict(),
@@ -702,20 +708,14 @@ def _run_router_training_started(
         config.to_run_config(model=config.teacher_model, validate_output=False),
         limit=config.training_data_limit,
     )
-    run_config = config.to_run_config(model=config.teacher_model, validate_output=False)
-    batch = teacher.build_batch(run_config, examples)
     block_ids = tuple(block.block_id for block in blocks)
-    teacher_output = teacher.reference_forward(batch, block_ids=block_ids)
-    student_output = (
-        teacher_output
-        if adapters.shared_reference
-        else student.reference_forward(batch, block_ids=block_ids)
-    )
-    training_targets = _build_router_targets(
+    training_targets = _build_router_targets_for_examples(
         config,
-        example_ids=batch.example_ids,
-        teacher_output=teacher_output,
-        student_output=student_output,
+        teacher=teacher,
+        student=student,
+        examples=examples,
+        split=config.split,
+        shared_reference=adapters.shared_reference,
         candidate_distortions=candidate_distortions,
         block_ids=block_ids,
     )
@@ -730,31 +730,13 @@ def _run_router_training_started(
             ),
             limit=config.validation_data_limit,
         )
-        validation_batch = teacher.build_batch(
-            config.to_run_config(
-                model=config.teacher_model,
-                split=config.validation_split,
-                validate_output=False,
-            ),
-            validation_examples,
-        )
-        validation_teacher_output = teacher.reference_forward(
-            validation_batch,
-            block_ids=block_ids,
-        )
-        validation_student_output = (
-            validation_teacher_output
-            if adapters.shared_reference
-            else student.reference_forward(
-                validation_batch,
-                block_ids=block_ids,
-            )
-        )
-        validation_targets = _build_router_targets(
+        validation_targets = _build_router_targets_for_examples(
             config,
-            example_ids=validation_batch.example_ids,
-            teacher_output=validation_teacher_output,
-            student_output=validation_student_output,
+            teacher=teacher,
+            student=student,
+            examples=validation_examples,
+            split=config.validation_split,
+            shared_reference=adapters.shared_reference,
             candidate_distortions=candidate_distortions,
             block_ids=block_ids,
         )
@@ -1199,6 +1181,68 @@ def _build_router_targets(
     return tuple(targets)
 
 
+def _build_router_targets_for_examples(
+    config: RouterTrainingConfig,
+    *,
+    teacher: Any,
+    student: Any,
+    examples: tuple[Any, ...],
+    split: str,
+    shared_reference: bool,
+    candidate_distortions: Mapping[str, Mapping[int, float]],
+    block_ids: tuple[str, ...],
+) -> tuple[RouterTrainingTarget, ...]:
+    targets: list[RouterTrainingTarget] = []
+    run_config = config.to_run_config(
+        model=config.teacher_model,
+        split=split,
+        validate_output=False,
+    )
+    for example_batch in _example_batches(
+        examples,
+        batch_size=config.reference_batch_size,
+    ):
+        batch = teacher.build_batch(run_config, example_batch)
+        teacher_output = teacher.reference_forward(batch, block_ids=block_ids)
+        student_output = (
+            teacher_output
+            if shared_reference
+            else student.reference_forward(batch, block_ids=block_ids)
+        )
+        targets.extend(
+            _build_router_targets(
+                config,
+                example_ids=batch.example_ids,
+                teacher_output=teacher_output,
+                student_output=student_output,
+                candidate_distortions=candidate_distortions,
+                block_ids=block_ids,
+            )
+        )
+    if not targets:
+        raise RouterTrainingError(
+            "missing_router_targets",
+            "router objective produced no targets",
+        )
+    return tuple(targets)
+
+
+def _example_batches(
+    examples: tuple[Any, ...],
+    *,
+    batch_size: int,
+) -> tuple[tuple[Any, ...], ...]:
+    if batch_size <= 0:
+        raise RouterTrainingError(
+            "invalid_router_training_config",
+            "reference_batch_size must be positive",
+        )
+    return tuple(
+        examples[index : index + batch_size]
+        for index in range(0, len(examples), batch_size)
+    )
+
+
 def _objective_samples_and_gradients(
     checkpoint: RouterCheckpoint,
     targets: tuple[RouterTrainingTarget, ...],
@@ -1262,6 +1306,7 @@ def _save_target_audit(
         "validation_split": config.validation_split,
         "training_sample_count": training_sample_count,
         "validation_sample_count": validation_sample_count,
+        "reference_batch_size": config.reference_batch_size,
         "target_record_count": len(training_targets),
         "validation_target_record_count": len(validation_targets),
         "precision_candidates": list(config.precision_candidates),
@@ -1566,6 +1611,7 @@ def _training_metadata(
         "validation_split": config.validation_split,
         "training_sample_count": training_sample_count,
         "validation_sample_count": validation_sample_count,
+        "reference_batch_size": config.reference_batch_size,
         "target_record_count": target_record_count,
         "teacher_model": config.teacher_model,
         "student_model": config.student_model,

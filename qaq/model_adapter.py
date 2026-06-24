@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -318,9 +319,16 @@ class FakeCausalLMAdapter:
 class HuggingFaceTokenizer:
     """Tokenizer wrapper exposing the local tokenizer protocol."""
 
-    def __init__(self, tokenizer: Any, tokenizer_id: str) -> None:
+    def __init__(
+        self,
+        tokenizer: Any,
+        tokenizer_id: str,
+        *,
+        tokenizer_ref: str | None = None,
+    ) -> None:
         self._tokenizer = tokenizer
         self.tokenizer_id = tokenizer_id
+        self.tokenizer_ref = tokenizer_ref or tokenizer_id
         self.pad_token_id = _resolve_pad_token_id(tokenizer)
         self.model_max_length = _resolve_model_max_length(tokenizer)
 
@@ -714,7 +722,13 @@ def verify_model_adapter_config(
         context_length_policy=context_length_policy,
     )
     adapter_kind = _adapter_kind(adapter)
+    gpu_selector_record = _gpu_selector_record_from_env()
     if load_weights:
+        if config.device == "cuda" and gpu_selector_record is None:
+            raise ModelAdapterError(
+                "missing_gpu_selector_record",
+                "CUDA weight-load verification must be launched through scripts/gpu_run.py",
+            )
         parameter_count = len(adapter.parameters())
         weights_loaded = True
         model_source = _loaded_model_source(adapter)
@@ -731,17 +745,23 @@ def verify_model_adapter_config(
         model_source=model_source,
     )
     architecture = adapter.architecture_metadata.as_dict()
+    model_ref = str(getattr(adapter, "model_ref", config.model))
+    tokenizer_ref = str(getattr(adapter.tokenizer, "tokenizer_ref", config.tokenizer))
     result = {
         "status": "completed",
         "verification_type": "model_adapter",
         "model": config.model,
         "tokenizer": config.tokenizer,
+        "resolved_model_ref": model_ref,
+        "resolved_tokenizer_ref": tokenizer_ref,
         "dataset": config.dataset,
         "split": config.split,
         "prompt_format": config.prompt_format or "plain",
         "metric": config.metric,
         "device": config.device,
         "selected_gpu_ids": list(config.gpu_ids),
+        "gpu_selector_record": gpu_selector_record,
+        "selected_physical_gpu_ids": _selected_physical_gpu_ids(gpu_selector_record),
         "hf_device_map": config.hf_device_map or "single",
         "hf_max_memory_per_gpu": config.hf_max_memory_per_gpu,
         "adapter_kind": adapter_kind,
@@ -757,16 +777,112 @@ def verify_model_adapter_config(
         "parameter_count": parameter_count,
         **provenance,
     }
-    result["accepted_as_real_adapter_verification"] = (
-        adapter_kind == "huggingface_llama"
-        and not result["diagnostic"]
-        and result["benchmark_is_real"]
-        and result["model_source"] in {
-            "huggingface_local_metadata",
-            "huggingface_local_pretrained",
-        }
+    evidence_level = _adapter_verification_evidence_level(
+        config=config,
+        result=result,
+        model_ref=model_ref,
+        tokenizer_ref=tokenizer_ref,
     )
+    result["evidence_level"] = evidence_level
+    result["accepted_as_real_adapter_verification"] = evidence_level == "real_subset_path"
+    result["accepted_as_benchmark_result"] = False
+    result["benchmark_acceptance_reason"] = "adapter_verification_is_not_full_comparison"
     return result
+
+
+def _gpu_selector_record_from_env() -> dict[str, Any] | None:
+    value = os.environ.get("QAQ_GPU_RUN_STATUS")
+    if not value:
+        return None
+    try:
+        decoded = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(decoded, dict):
+        return decoded
+    return None
+
+
+def _selected_physical_gpu_ids(record: Mapping[str, Any] | None) -> list[int]:
+    if record is None:
+        return []
+    selected = record.get("selected_physical_gpu_ids")
+    if not isinstance(selected, list | tuple):
+        return []
+    return [int(item) for item in selected if isinstance(item, int) and not isinstance(item, bool)]
+
+
+def _adapter_verification_evidence_level(
+    *,
+    config: RunConfig,
+    result: Mapping[str, Any],
+    model_ref: str,
+    tokenizer_ref: str,
+) -> str:
+    if result.get("diagnostic") is True:
+        return "diagnostic_fake_path"
+    if result.get("adapter_kind") != "huggingface_llama":
+        return "diagnostic_fake_path"
+    if not _is_actual_llama31_real_subset(
+        config=config,
+        result=result,
+        model_ref=model_ref,
+        tokenizer_ref=tokenizer_ref,
+    ):
+        return "tiny_real_mechanism_path"
+    return "real_subset_path"
+
+
+def _is_actual_llama31_real_subset(
+    *,
+    config: RunConfig,
+    result: Mapping[str, Any],
+    model_ref: str,
+    tokenizer_ref: str,
+) -> bool:
+    return all(
+        (
+            config.model == "meta-llama/Llama-3.1-8B",
+            config.tokenizer == "meta-llama/Llama-3.1-8B",
+            result.get("benchmark_is_real") is True,
+            result.get("dataset_is_fake") is False,
+            result.get("model_is_fake") is False,
+            result.get("tokenizer_is_fake") is False,
+            result.get("fixture_only_data") is False,
+            _has_local_hf_config(model_ref),
+            _has_local_hf_tokenizer_files(tokenizer_ref),
+            not _path_has_test_or_tmp_provenance(model_ref),
+            not _path_has_test_or_tmp_provenance(tokenizer_ref),
+        )
+    )
+
+
+def _has_local_hf_config(model_ref: str) -> bool:
+    path = Path(model_ref)
+    if path.is_file():
+        return path.name == "config.json"
+    return path.is_dir() and (path / "config.json").is_file()
+
+
+def _has_local_hf_tokenizer_files(tokenizer_ref: str) -> bool:
+    path = Path(tokenizer_ref)
+    if path.is_file():
+        return path.name in {
+            "tokenizer.json",
+            "tokenizer.model",
+            "tokenizer_config.json",
+        }
+    if not path.is_dir():
+        return False
+    return any(
+        (path / name).is_file()
+        for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")
+    )
+
+
+def _path_has_test_or_tmp_provenance(value: str) -> bool:
+    lowered = value.lower()
+    return any(token in lowered for token in ("/tmp/", "tests/fixtures", "test_model_adapter"))
 
 
 def _adapter_kind(adapter: Any) -> str:
@@ -837,7 +953,7 @@ def _load_any_tokenizer(tokenizer_ref: str, *, tokenizer_id: str | None = None) 
             "tokenizer_unavailable",
             f"tokenizer {tokenizer_id!r} is not a supported fake tokenizer or local Hugging Face tokenizer: {exc}",
         ) from exc
-    return HuggingFaceTokenizer(tokenizer, tokenizer_id)
+    return HuggingFaceTokenizer(tokenizer, tokenizer_id, tokenizer_ref=tokenizer_ref)
 
 
 def _try_load_fake_model_metadata(model_id: str) -> dict[str, Any] | None:
@@ -1437,6 +1553,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Also load model weights; use only on the lab GPU server for large checkpoints.",
     )
     parser.add_argument("--print-json", action="store_true", help="Print verification JSON.")
+    parser.add_argument("--output", help="Write verification JSON to this path.")
     args = parser.parse_args(argv)
     try:
         config = load_config_file(args.config, validate_output=False)
@@ -1455,6 +1572,10 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     if args.print_json:
         print(json.dumps(result, sort_keys=True))
     return 0

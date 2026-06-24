@@ -2,6 +2,8 @@
 
 This contract prevents smoke, fake, diagnostic, tiny fixture, sampled, or local CPU paths from being treated as completed QAQ research evidence. Diagnostic paths are allowed only as health checks. They must never satisfy `done`, `accepted`, `paper_result`, `benchmark_result`, or `real_qaq_result`.
 
+The repository evidence ladder is: diagnostic fake path, tiny real-mechanism path, real-subset path, and accepted benchmark path. Result artifacts use the machine values below, but acceptance decisions must preserve that ladder: diagnostic fake and tiny-mechanism evidence are rejected as accepted benchmark evidence, and real-subset evidence is rejected when the run is a subset/debug run rather than the full comparable benchmark contract.
+
 ## Evidence Levels
 
 ### `diagnostic_health_check`
@@ -34,6 +36,7 @@ Every result artifact must include:
 - `diagnostic`
 - `dataset_is_fake`
 - `model_is_fake`
+- `tokenizer_is_fake`
 - `artifact_scope`
 - `artifact_ref_mode`
 - `mixed_precision_forward_applied`
@@ -50,6 +53,7 @@ Every result artifact must include:
 - `diagnostic` is true.
 - `dataset_is_fake` is true.
 - `model_is_fake` is true.
+- `tokenizer_is_fake` is true.
 - The benchmark, split, artifact scope, or metadata indicates smoke, fixture, synthetic, tiny, sampled, truncated, router health-check, or diagnostic data.
 - `completion_status` is not `completed`.
 - `mode` is `fixed_mixed`.
@@ -57,6 +61,7 @@ Every result artifact must include:
 - `mode` is `static_8bit`, `static_4bit`, `qaq_on_demand_off`, or `qaq_on_demand_on` and `artifact_ref_mode` is not `full_tensor_index`.
 - `artifact_ref_mode` is `partial_tensor_index` or `legacy_bit_width_index`.
 - A large-model experiment lacks a `gpu_selector_record` from `scripts/gpu_run.py`.
+- A GPU-required or large-model run has a GPU selector record but lacks non-empty `selected_physical_gpu_ids`.
 
 The schema must record every applicable rejection in `rejection_reasons`. Result validation rejects contradictory artifacts, such as a fake dataset marked accepted.
 
@@ -82,8 +87,8 @@ A result artifact must be rejected as accepted evidence if any of the following 
 - `fake == true`
 - dataset is `fake_smoke`
 - model id starts with `fake-` or `fake_`
-- tokenizer id starts with `fake-` or `fake_`
+- tokenizer id starts with `fake-` or `fake_`, or otherwise indicates smoke, fixture, synthetic, toy, or tiny provenance
 - model source is mocked, synthetic, TinyHFModel, or fixture-only
 - `mixed_precision_forward_applied != true` for quantized or QAQ modes
 - `artifact_ref_mode != full_tensor_index` for accepted quantized runtime evidence
-- selected physical GPU IDs are missing for GPU-required runs
+- selected physical GPU IDs are missing or empty for GPU-required runs

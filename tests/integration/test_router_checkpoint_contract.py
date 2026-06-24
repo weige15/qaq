@@ -9,7 +9,7 @@ from qaq.blocks import discover_mha_ffn_blocks
 from qaq.config import RunConfig, load_config_file
 from qaq.data import export_router_training_jsonl
 from qaq.evaluate import main as evaluate_main
-from qaq.model_adapter import load_model_adapter
+from qaq.model_adapter import FakeCausalLMAdapter, load_model_adapter
 from qaq.router import train as router_train_module
 from qaq.router.checkpoint import (
     RouterCheckpoint,
@@ -384,6 +384,44 @@ def test_router_training_real_data_acceptance_writes_reloadable_checkpoint_and_e
     assert len(payload["metadata"]["precision_plans"]) == 2
     assert len(payload["metadata"]["routing_traces"]) == 8
     assert len(payload["reconstruction_records"]) == 8
+
+
+def test_router_training_reference_forwards_use_configured_microbatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = _training_mapping(tmp_path)
+    data["reference_batch_size"] = 2
+    data["output_dir"] = str(tmp_path / "router-train-microbatched")
+    data["router"] = {
+        **data["router"],
+        "max_steps": 1,
+    }
+    seen_batch_sizes: list[int] = []
+    original_forward = FakeCausalLMAdapter.reference_forward
+
+    def wrapped_forward(self, batch, *args, **kwargs):
+        seen_batch_sizes.append(batch.metadata.batch_size)
+        return original_forward(self, batch, *args, **kwargs)
+
+    monkeypatch.setattr(
+        FakeCausalLMAdapter,
+        "reference_forward",
+        wrapped_forward,
+    )
+
+    result = run_router_training(RouterTrainingConfig.from_mapping(data))
+    loaded = load_router_checkpoint(result.checkpoint_path)
+    target_audit = json.loads(result.target_audit_path.read_text(encoding="utf-8"))
+
+    assert seen_batch_sizes == [2, 1, 2]
+    assert loaded.metadata.training_metadata["reference_batch_size"] == 2
+    assert loaded.metadata.training_metadata["training_sample_count"] == 3
+    assert loaded.metadata.training_metadata["validation_sample_count"] == 2
+    assert loaded.metadata.training_metadata["target_record_count"] == 12
+    assert target_audit["reference_batch_size"] == 2
+    assert target_audit["target_record_count"] == 12
+    assert target_audit["validation_target_record_count"] == 8
 
 
 def test_router_training_accepts_tensor_native_student_artifacts(

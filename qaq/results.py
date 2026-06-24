@@ -95,6 +95,7 @@ class ResultArtifact:
     diagnostic: bool
     dataset_is_fake: bool
     model_is_fake: bool
+    tokenizer_is_fake: bool
     artifact_scope: str
     artifact_ref_mode: str
     mixed_precision_forward_applied: bool
@@ -138,6 +139,7 @@ class ResultArtifact:
             "diagnostic": self.diagnostic,
             "dataset_is_fake": self.dataset_is_fake,
             "model_is_fake": self.model_is_fake,
+            "tokenizer_is_fake": self.tokenizer_is_fake,
             "artifact_scope": self.artifact_scope,
             "artifact_ref_mode": self.artifact_ref_mode,
             "mixed_precision_forward_applied": self.mixed_precision_forward_applied,
@@ -250,6 +252,7 @@ def build_result_artifact(
     )
     dataset_is_fake = _is_fake_dataset(config.dataset)
     model_is_fake = _is_fake_model(config.model)
+    tokenizer_is_fake = _is_fake_tokenizer(config.tokenizer)
     diagnostic = _is_diagnostic_result(config, output)
     artifact_scope = _artifact_scope(
         config,
@@ -268,6 +271,7 @@ def build_result_artifact(
         diagnostic=diagnostic,
         dataset_is_fake=dataset_is_fake,
         model_is_fake=model_is_fake,
+        tokenizer_is_fake=tokenizer_is_fake,
         artifact_scope=artifact_scope,
         artifact_ref_mode=artifact_ref_mode,
         mixed_precision_forward_applied=mixed_precision_forward_applied,
@@ -312,6 +316,7 @@ def build_result_artifact(
         diagnostic=diagnostic,
         dataset_is_fake=dataset_is_fake,
         model_is_fake=model_is_fake,
+        tokenizer_is_fake=tokenizer_is_fake,
         artifact_scope=artifact_scope,
         artifact_ref_mode=artifact_ref_mode,
         mixed_precision_forward_applied=mixed_precision_forward_applied,
@@ -359,6 +364,7 @@ def validate_result_artifact(artifact: ResultArtifact | Mapping[str, Any]) -> No
         "diagnostic",
         "dataset_is_fake",
         "model_is_fake",
+        "tokenizer_is_fake",
         "artifact_scope",
         "artifact_ref_mode",
         "mixed_precision_forward_applied",
@@ -424,6 +430,7 @@ def validate_result_artifact(artifact: ResultArtifact | Mapping[str, Any]) -> No
     for field_name in (
         "dataset_is_fake",
         "model_is_fake",
+        "tokenizer_is_fake",
         "mixed_precision_forward_applied",
         "accepted_as_qaq_result",
     ):
@@ -492,6 +499,7 @@ def result_artifact_from_mapping(value: Mapping[str, Any]) -> ResultArtifact:
         diagnostic=bool(value["diagnostic"]),
         dataset_is_fake=bool(value["dataset_is_fake"]),
         model_is_fake=bool(value["model_is_fake"]),
+        tokenizer_is_fake=bool(value["tokenizer_is_fake"]),
         artifact_scope=str(value["artifact_scope"]),
         artifact_ref_mode=str(value["artifact_ref_mode"]),
         mixed_precision_forward_applied=bool(value["mixed_precision_forward_applied"]),
@@ -650,9 +658,12 @@ def validate_comparison(
                 reasons.append("missing_loader_activity:qaq_on_demand_on")
 
     fake_model_flags = {artifact.model_is_fake for artifact in artifacts}
+    fake_tokenizer_flags = {artifact.tokenizer_is_fake for artifact in artifacts}
     fake_dataset_flags = {artifact.dataset_is_fake for artifact in artifacts}
     if len(fake_model_flags) > 1:
         reasons.append("mixed_fake_real_models")
+    if len(fake_tokenizer_flags) > 1:
+        reasons.append("mixed_fake_real_tokenizers")
     if len(fake_dataset_flags) > 1:
         reasons.append("mixed_fake_real_datasets")
 
@@ -872,6 +883,7 @@ def _contract_rejection_reasons(
     diagnostic: bool,
     dataset_is_fake: bool,
     model_is_fake: bool,
+    tokenizer_is_fake: bool,
     artifact_scope: str,
     artifact_ref_mode: str,
     mixed_precision_forward_applied: bool,
@@ -891,6 +903,8 @@ def _contract_rejection_reasons(
         reasons.append("fake_dataset")
     if model_is_fake:
         reasons.append("fake_model")
+    if tokenizer_is_fake:
+        reasons.append("fake_tokenizer")
     if _uses_smoke_fixture_or_synthetic_data(
         benchmark_name=benchmark_name,
         benchmark_split=benchmark_split,
@@ -909,8 +923,11 @@ def _contract_rejection_reasons(
             reasons.append(f"unaccepted_artifact_ref_mode:{artifact_ref_mode}")
         elif artifact_ref_mode != "full_tensor_index":
             reasons.append(f"missing_full_tensor_artifact_index:{artifact_ref_mode}")
-    if _is_large_model_experiment(model=model, gpu_ids=tuple(gpu_ids)) and not gpu_selector_record:
-        reasons.append("missing_gpu_selector_record")
+    if _is_large_model_experiment(model=model, gpu_ids=tuple(gpu_ids)):
+        if not gpu_selector_record:
+            reasons.append("missing_gpu_selector_record")
+        elif not _has_selected_physical_gpu_ids(gpu_selector_record):
+            reasons.append("missing_selected_physical_gpu_ids")
     return tuple(dict.fromkeys(reasons))
 
 
@@ -919,6 +936,7 @@ def _evidence_level_for_rejections(reasons: Sequence[str]) -> str:
         "diagnostic_result",
         "fake_dataset",
         "fake_model",
+        "fake_tokenizer",
         "smoke_fixture_or_synthetic_data",
         "fixed_mixed_diagnostic_mode",
     }
@@ -937,6 +955,7 @@ def _validate_acceptance_contract_fields(value: Mapping[str, Any]) -> None:
         diagnostic=bool(value["diagnostic"]),
         dataset_is_fake=bool(value["dataset_is_fake"]),
         model_is_fake=bool(value["model_is_fake"]),
+        tokenizer_is_fake=bool(value["tokenizer_is_fake"]),
         artifact_scope=str(value["artifact_scope"]),
         artifact_ref_mode=str(value["artifact_ref_mode"]),
         mixed_precision_forward_applied=bool(value["mixed_precision_forward_applied"]),
@@ -1001,6 +1020,25 @@ def _is_fake_model(model: str) -> bool:
         token in lowered
         for token in ("fake", "smoke", "fixture", "synthetic", "toy", "tiny")
     ) or "tests/fixtures" in str(path)
+
+
+def _is_fake_tokenizer(tokenizer: str) -> bool:
+    lowered = tokenizer.lower()
+    path = Path(tokenizer)
+    return any(
+        token in lowered
+        for token in ("fake", "smoke", "fixture", "synthetic", "toy", "tiny")
+    ) or "tests/fixtures" in str(path)
+
+
+def _has_selected_physical_gpu_ids(record: Mapping[str, Any]) -> bool:
+    selected = record.get("selected_physical_gpu_ids")
+    if not isinstance(selected, Sequence) or isinstance(selected, str | bytes | bytearray):
+        return False
+    return bool(selected) and all(
+        isinstance(item, int) and not isinstance(item, bool)
+        for item in selected
+    )
 
 
 def _is_benchmark_subset_run(metadata: Mapping[str, Any]) -> bool:

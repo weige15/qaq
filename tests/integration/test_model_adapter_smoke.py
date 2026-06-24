@@ -192,7 +192,7 @@ def test_named_real_benchmark_without_local_or_cached_data_fails_actionably(
     assert "hellaswag/validation.jsonl" in exc.value.message
 
 
-def test_real_llama_adapter_verification_uses_local_hf_tokenizer_and_real_benchmark_rows(
+def test_tiny_llama_adapter_verification_is_mechanism_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -290,7 +290,9 @@ def test_real_llama_adapter_verification_uses_local_hf_tokenizer_and_real_benchm
     assert result["fixture_only_data"] is False
     assert result["benchmark_is_real"] is True
     assert result["diagnostic"] is False
-    assert result["accepted_as_real_adapter_verification"] is True
+    assert result["evidence_level"] == "tiny_real_mechanism_path"
+    assert result["accepted_as_real_adapter_verification"] is False
+    assert result["accepted_as_benchmark_result"] is False
     assert result["weights_loaded"] is False
     assert result["architecture"]["framework"] == "transformers_llama"
     assert result["controlled_block_count"] == 4
@@ -302,9 +304,24 @@ def test_real_llama_adapter_verification_uses_local_hf_tokenizer_and_real_benchm
     config_path = tmp_path / "verify_config.json"
     config_path.write_text(json.dumps(config_data), encoding="utf-8")
 
-    assert model_adapter_main(["--config", str(config_path), "--limit", "1", "--print-json"]) == 0
+    output_path = tmp_path / "verify_artifact.json"
+    assert model_adapter_main(
+        [
+            "--config",
+            str(config_path),
+            "--limit",
+            "1",
+            "--output",
+            str(output_path),
+            "--print-json",
+        ]
+    ) == 0
     payload = json.loads(capsys.readouterr().out)
-    assert payload["accepted_as_real_adapter_verification"] is True
+    written = json.loads(output_path.read_text(encoding="utf-8"))
+    assert payload == written
+    assert payload["evidence_level"] == "tiny_real_mechanism_path"
+    assert payload["accepted_as_real_adapter_verification"] is False
+    assert payload["accepted_as_benchmark_result"] is False
     assert payload["weights_loaded"] is False
 
 
@@ -618,6 +635,20 @@ def test_huggingface_device_map_auto_load_does_not_call_model_to(
         "device_map": "auto",
         "max_memory": {0: "22GiB", 1: "22GiB"},
     }
+
+
+def test_cuda_weight_load_verification_requires_gpu_selector(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("QAQ_GPU_RUN_STATUS", raising=False)
+    config = _config(tmp_path, device="cuda", gpu_ids=[0])
+
+    with pytest.raises(ModelAdapterError) as exc:
+        verify_model_adapter_config(config, load_weights=True)
+
+    assert exc.value.code == "missing_gpu_selector_record"
+    assert "scripts/gpu_run.py" in exc.value.message
 
 
 def test_unavailable_model_and_dataset_fail_clearly(tmp_path: Path) -> None:

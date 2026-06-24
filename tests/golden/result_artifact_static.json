@@ -105,5 +105,6 @@
   "score": 0.75,
   "seed": 7,
   "split": "validation",
-  "tokenizer": "LLaMA-3.1-8B"
+  "tokenizer": "LLaMA-3.1-8B",
+  "tokenizer_is_fake": false
 }

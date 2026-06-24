@@ -62,6 +62,8 @@ runs/llama_first_milestone/router/checkpoints/router_final.json
 
 That final alias is the path used by the first-milestone HellaSwag QAQ configs.
 
+Current first-milestone status: this command completed on `basic-2` through `scripts/gpu_run.py` with physical RTX 3090 GPUs 0 and 1 selected. It wrote `runs/llama_first_milestone/router/checkpoints/router_final.json`, `runs/llama_first_milestone/router/router_targets.json`, and `runs/gpu-selector/hellaswag-router-train-full.json`. The checkpoint metadata is non-diagnostic, uses 64 LLaMA controlled blocks, candidate bit widths `[4, 8]`, feature source `layer_output_pooled_shared_mha_ffn`, 128 real HellaSwag training rows, 32 validation rows, `reference_batch_size: 1`, and full tensor-native artifacts from `runs/llama31_8b_full_tensor_bitplanes/runtime_artifact_index.json`. This checkpoint unblocks QAQ mode evaluation, but it is not by itself a completed five-mode benchmark matrix.
+
 The checkpoint-loaded evaluation command for the local regression fixture remains:
 
 ```bash
@@ -96,9 +98,11 @@ A full Llama 3.1 8B router-training command additionally requires:
 If those artifacts or local Hugging Face files are absent, the run must fail clearly instead of falling back to fake/local metadata.
 
 The current router trainer intentionally performs a CUDA capacity preflight
-before loading Hugging Face weights. When `teacher_model` and `student_model`
-are the same exact model reference, the trainer uses a shared frozen reference
-adapter and reuses the teacher forward output as the student reference output.
+before loading Hugging Face weights, and it uses `reference_batch_size` to avoid
+holding the full train/validation subset activations in one LLaMA forward. When
+`teacher_model` and `student_model` are the same exact model reference, the
+trainer uses a shared frozen reference adapter and reuses the teacher forward
+output as the student reference output.
 This is valid for the current minimal objective because quantized-student
 effects enter through bit-plane artifact reconstruction distortion rather than
 through a separately executed quantized transformer. Distinct teacher and

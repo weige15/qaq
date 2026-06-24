@@ -95,6 +95,22 @@ def test_manifest_completion_removes_incomplete_marker(tmp_path: Path) -> None:
     assert not (tmp_path / "run" / "INCOMPLETE").exists()
 
 
+def test_manifest_completion_removes_stale_incomplete_marker(tmp_path: Path) -> None:
+    config = RunConfig.from_mapping(base_config(tmp_path), available_gpu_count=8)
+    stale_marker = tmp_path / "run" / "INCOMPLETE"
+    stale_marker.parent.mkdir(parents=True, exist_ok=True)
+    stale_marker.write_text("previous_failure: stale\n", encoding="utf-8")
+    manifest = create_run_manifest(config, run_id="test-run")
+
+    manifest.mark_completed(completed_at="2026-06-23T01:00:00+00:00")
+
+    data = json.loads(manifest.manifest_path.read_text(encoding="utf-8"))
+    assert data["status"] == STATUS_COMPLETED
+    assert data["failure"] is None
+    assert data["incomplete_marker"] is None
+    assert not stale_marker.exists()
+
+
 def test_loads_json_config_fixture(tmp_path: Path) -> None:
     fixture = Path("tests/fixtures/configs/valid_static_8bit.json")
     raw = json.loads(fixture.read_text(encoding="utf-8"))

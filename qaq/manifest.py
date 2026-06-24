@@ -96,14 +96,20 @@ class RunManifest:
         self.status = STATUS_COMPLETED
         self.completed_at = completed_at or _now_iso()
         self.failure = None
-        marker = Path(self.incomplete_marker) if self.incomplete_marker else None
+        markers = []
+        if self.incomplete_marker:
+            markers.append(Path(self.incomplete_marker))
+        stale_marker = self.manifest_path.parent / "INCOMPLETE"
+        if stale_marker not in markers:
+            markers.append(stale_marker)
         self.incomplete_marker = None
         self.write()
-        if marker and marker.exists():
-            try:
-                marker.unlink()
-            except OSError as exc:
-                raise ManifestError("incomplete_marker_remove_failed", str(exc)) from exc
+        for marker in markers:
+            if marker.exists():
+                try:
+                    marker.unlink()
+                except OSError as exc:
+                    raise ManifestError("incomplete_marker_remove_failed", str(exc)) from exc
 
     def mark_failed(
         self,

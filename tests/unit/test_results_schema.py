@@ -129,6 +129,10 @@ def _artifact(
         token in model.lower()
         for token in ("fake", "smoke", "fixture", "synthetic", "toy", "tiny")
     )
+    tokenizer_is_fake = any(
+        token in tokenizer.lower()
+        for token in ("fake", "smoke", "fixture", "synthetic", "toy", "tiny")
+    )
     rejection_reasons: list[str] = []
     if completion_status != "completed":
         rejection_reasons.append("incomplete_result")
@@ -138,6 +142,8 @@ def _artifact(
         rejection_reasons.append("fake_dataset")
     if model_is_fake:
         rejection_reasons.append("fake_model")
+    if tokenizer_is_fake:
+        rejection_reasons.append("fake_tokenizer")
     metadata_text = json.dumps(metadata, sort_keys=True).lower()
     if any(
         token in " ".join((dataset, split, artifact_scope, metadata_text)).lower()
@@ -167,8 +173,12 @@ def _artifact(
             rejection_reasons.append(f"unaccepted_artifact_ref_mode:{artifact_ref_mode}")
         elif artifact_ref_mode != "full_tensor_index":
             rejection_reasons.append(f"missing_full_tensor_artifact_index:{artifact_ref_mode}")
-    if "llama" in model.lower() and not gpu_selector_record:
-        rejection_reasons.append("missing_gpu_selector_record")
+    if "llama" in model.lower():
+        selected = (gpu_selector_record or {}).get("selected_physical_gpu_ids")
+        if not gpu_selector_record:
+            rejection_reasons.append("missing_gpu_selector_record")
+        elif not isinstance(selected, list) or not selected or not all(isinstance(item, int) for item in selected):
+            rejection_reasons.append("missing_selected_physical_gpu_ids")
     rejection_reasons = list(dict.fromkeys(rejection_reasons))
     evidence_level = (
         "diagnostic_health_check"
@@ -178,6 +188,7 @@ def _artifact(
                 "diagnostic_result",
                 "fake_dataset",
                 "fake_model",
+                "fake_tokenizer",
                 "smoke_fixture_or_synthetic_data",
             }
             for reason in rejection_reasons
@@ -241,6 +252,7 @@ def _artifact(
         diagnostic=diagnostic,
         dataset_is_fake=dataset_is_fake,
         model_is_fake=model_is_fake,
+        tokenizer_is_fake=tokenizer_is_fake,
         artifact_scope=artifact_scope,
         artifact_ref_mode=artifact_ref_mode,
         mixed_precision_forward_applied=mixed_precision_forward_applied,

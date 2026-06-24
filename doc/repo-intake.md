@@ -113,6 +113,13 @@ python scripts/gpu_run.py --count 1 --min-free-mb 1000 -- python -m qaq.llama_bi
 python scripts/gpu_run.py --count 1 --min-free-mb 18000 -- python -m qaq.router.train --config configs/router_train_llama31_8b_sampled.yaml
 ```
 
+- Documented real first-milestone LLaMA/HellaSwag router-training command. Evidence: `doc/router-training.md`, `configs/router_train_llama31_8b_full_hellaswag.yaml`, and completed artifacts under `runs/llama_first_milestone/router/`:
+
+```bash
+# cwd: /nfs/home/s314511048/qaq
+python scripts/gpu_run.py --count 2 --min-free-mb 22000 --status-file runs/gpu-selector/hellaswag-router-train-full.json -- python -m qaq.router.train --config configs/router_train_llama31_8b_full_hellaswag.yaml
+```
+
 - Verified real LLaMA-3.1-8B HellaSwag FP16 subset evaluation command. Evidence: `configs/benchmarks/llama_first_milestone/hellaswag/fp16.json`, `qaq/evaluate.py`, `qaq/results.py`, and `scripts/gpu_run.py`. This is real-path subset evidence and is rejected for full QAQ acceptance with `benchmark_subset_not_full_acceptance` until the full comparable five-mode matrix exists:
 
 ```bash
@@ -163,7 +170,7 @@ python -m pytest -q tests/integration/test_tensor_bitplane_artifacts.py tests/in
 ```
 
 - Warning: optional-package tests may skip when `torch`, `safetensors`, or CUDA are unavailable. Evidence: `pytest.importorskip` and CUDA checks in `tests/integration/test_tensor_bitplane_artifacts.py`, `tests/integration/test_llama_bitplane_generation.py`, and `tests/integration/test_on_demand_loader_simulation.py`.
-- No test suite was run during this intake; only read-only inspection commands and this documentation edit were performed.
+- Intake was updated during the router-checkpoint pass; targeted tests and the GPU-wrapped router-training command are recorded in `doc/tasks/progress.md`.
 
 ## Existing Modules
 

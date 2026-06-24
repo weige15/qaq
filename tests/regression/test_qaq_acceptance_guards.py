@@ -332,6 +332,83 @@ def test_fake_smoke_result_artifacts_are_never_accepted(tmp_path: Path) -> None:
     assert any("fake_dataset" in artifact.rejection_reasons for artifact in artifacts)
 
 
+
+def test_acceptance_contract_rejects_fake_model_ids() -> None:
+    artifact = _metadata_result_artifact(
+        "fp16",
+        model="fake-llama-adapter",
+        tokenizer="LLaMA-3.1-8B",
+        dataset="HellaSwag",
+    )
+
+    assert artifact.accepted_as_qaq_result is False
+    assert artifact.evidence_level == "diagnostic_health_check"
+    assert "fake_model" in artifact.rejection_reasons
+
+
+def test_acceptance_contract_rejects_fake_tokenizer_ids() -> None:
+    artifact = _metadata_result_artifact(
+        "fp16",
+        model="LLaMA-3.1-8B",
+        tokenizer="fake-qaq-smoke-tokenizer",
+        dataset="HellaSwag",
+    )
+
+    assert artifact.accepted_as_qaq_result is False
+    assert artifact.evidence_level == "diagnostic_health_check"
+    assert artifact.tokenizer_is_fake is True
+    assert "fake_tokenizer" in artifact.rejection_reasons
+
+
+def test_acceptance_contract_rejects_fake_smoke_dataset() -> None:
+    artifact = _metadata_result_artifact(
+        "fp16",
+        model="LLaMA-3.1-8B",
+        tokenizer="LLaMA-3.1-8B",
+        dataset="fake_smoke",
+        prompt_format="fake_smoke_v1",
+    )
+
+    assert artifact.accepted_as_qaq_result is False
+    assert artifact.evidence_level == "diagnostic_health_check"
+    assert "fake_dataset" in artifact.rejection_reasons
+    assert "smoke_fixture_or_synthetic_data" in artifact.rejection_reasons
+
+
+def test_acceptance_contract_rejects_diagnostic_true() -> None:
+    artifact = _metadata_result_artifact("fp16", diagnostic=True)
+
+    assert artifact.accepted_as_qaq_result is False
+    assert artifact.evidence_level == "diagnostic_health_check"
+    assert "diagnostic_result" in artifact.rejection_reasons
+
+
+def test_acceptance_contract_rejects_quantized_without_mixed_forward() -> None:
+    artifact = _metadata_result_artifact(
+        "static_8bit",
+        mixed_precision_forward_applied=False,
+    )
+
+    assert artifact.accepted_as_qaq_result is False
+    assert "mixed_precision_forward_not_applied" in artifact.rejection_reasons
+
+
+def test_acceptance_contract_rejects_gpu_runs_without_selected_physical_ids() -> None:
+    artifact = _metadata_result_artifact(
+        "fp16",
+        gpu_selector_record={
+            "status": "selected",
+            "cuda_visible_devices": "0",
+            "pytorch_logical_mapping": {"cuda:0": 0},
+            "command": ["python", "-m", "qaq.evaluate"],
+        },
+    )
+
+    assert artifact.accepted_as_qaq_result is False
+    assert artifact.evidence_level == "real_path_implemented"
+    assert "missing_selected_physical_gpu_ids" in artifact.rejection_reasons
+
+
 def test_router_health_check_result_artifacts_are_never_accepted() -> None:
     artifact = _metadata_result_artifact(
         "qaq_on_demand_off",
